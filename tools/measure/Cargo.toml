@@ -1,0 +1,14 @@
+[package]
+name = "measure"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Host-side colorimetry for the c6-amoled panel: sweeps through the patch server with an i1Pro, the panel's colour model, a ColorChecker check and an image viewer — all in VSF's colorimetry"
+
+[dependencies]
+# No default features: skips libudev (port enumeration), which these tools don't need.
+serialport = { version = "4.10", default-features = false }
+# VSF's colorimetry: Stockman & Sharpe 2000 10° cone fundamentals, Illuminant E white, VSF RGB and wavelength-defined Rec.2020.
+vsf = { path = "../../../vsf" }
+tiff = "0.11"
+png = "0.18"

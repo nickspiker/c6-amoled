@@ -1,0 +1,111 @@
+Panel characterisation — measurements/i1pro-2026-10-11 (182 patches)
+VSF colorimetry from the spectra: Stockman & Sharpe 2000 10° cones, VSF photopic (relative), AGB ratios α = L/(L+M), β = S/(S+M), γ = M/(L+S). Illuminant E white is α = β = γ = 0.5.
+
+PRIMARIES (code 255, brightness 255, 24-bit, 240 px window)
+  ch    α       β       γ      L : M : S (sum 1)       share of white's photopic   peak nm  FWHM nm
+  r   0.7885  0.0021  0.2680   0.788 : 0.211 : 0.000         0.238                    620     25.5
+  g   0.4390  0.0140  1.2551   0.436 : 0.557 : 0.008         0.684                    530     22.8
+  b   0.3362  0.8505  0.1614   0.070 : 0.139 : 0.791         0.143                    460     15.9
+  w   0.4849  0.5366  0.4764   0.304 : 0.323 : 0.374         1.000                    —        —
+
+GAMUT vs Rec.2020 (VSF: 630/532/467 nm, cones SS2000 10°)
+  panel primary in Rec.2020 RGB        (negative = outside Rec.2020)
+    panel r:  +1.0000 +0.0619 -0.0002
+    panel g:  +0.0162 +1.0000 +0.0035
+    panel b:  +0.0501 -0.0912 +1.0000
+  Rec.2020 primary in panel RGB        (negative = beyond the panel)
+    2020 r:   +1.0000 -0.0463 +0.0003
+    2020 g:   -0.0214 +1.0000 -0.0031
+    2020 b:   -0.0763 +0.1045 +1.0000
+
+ADDITIVITY  white = 0.9463 × (R + G + B) spectrally (shape residual 1.56%); photopic white / Σ photopic = 0.9388
+
+RESPONSE (spectral scale k vs full drive; shape residual %) — the pixel EOTF, observer-free
+  code      R k     res%     G k     res%     B k     res%     W k     res%
+     1   0.00000 3080.13  -0.00000 1596.45   0.00000 2344.88   0.00001 807.93
+     2   0.00001 1088.94  -0.00000 4344.35   0.00000 1323.03   0.00000 8224.44
+     4   0.00002 532.00  -0.00000 4875.77   0.00001 389.49   0.00001 400.93
+     8   0.00004 231.51   0.00001 900.90   0.00042  12.07   0.00033  32.13
+    16   0.00125   9.20   0.00161   6.99   0.00198   3.00   0.00187   6.25
+    24   0.00407   3.86   0.00452   2.92   0.00492   1.68   0.00477   3.15
+    32   0.00812   3.21   0.00891   2.16   0.00931   0.92   0.00914   3.01
+    40   0.01369   2.93   0.01464   1.88   0.01512   0.73   0.01483   2.53
+    48   0.02142   2.59   0.02234   1.73   0.02289   0.67   0.02265   1.81
+    56   0.03005   2.51   0.03127   1.66   0.03245   0.55   0.03188   2.06
+    64   0.03961   2.34   0.04203   1.47   0.04299   0.51   0.04231   2.20
+    72   0.05179   2.15   0.05490   1.37   0.05615   0.47   0.05549   1.97
+    80   0.06626   2.00   0.07040   1.26   0.07193   0.40   0.07082   2.00
+    88   0.08270   1.84   0.08584   1.21   0.08841   0.36   0.08732   1.48
+    96   0.10036   1.72   0.10387   1.13   0.10794   0.31   0.10618   1.82
+   104   0.12202   1.58   0.12659   1.04   0.12977   0.28   0.12767   1.36
+   112   0.14671   1.48   0.15207   0.95   0.15497   0.26   0.15339   1.50
+   120   0.16965   1.37   0.17574   0.91   0.17990   0.23   0.17732   1.67
+   128   0.19790   1.26   0.20149   0.84   0.20577   0.24   0.20426   0.96
+   136   0.22379   1.16   0.22964   0.79   0.23491   0.21   0.23273   1.23
+   144   0.25182   1.06   0.25992   0.73   0.26694   0.20   0.26350   1.58
+   152   0.28867   0.93   0.29714   0.69   0.30413   0.25   0.30016   1.45
+   160   0.33174   0.83   0.33948   0.62   0.34416   0.16   0.34214   1.00
+   168   0.37119   0.75   0.37899   0.57   0.38521   0.14   0.38256   1.15
+   176   0.41151   0.67   0.42111   0.52   0.42945   0.15   0.42458   1.26
+   184   0.45841   0.59   0.46620   0.45   0.47711   0.13   0.47227   1.48
+   192   0.50438   0.53   0.51469   0.41   0.52309   0.11   0.51758   1.21
+   200   0.55918   0.44   0.56672   0.36   0.57684   0.12   0.56971   1.05
+   208   0.61106   0.39   0.62208   0.30   0.62771   0.09   0.62349   1.00
+   216   0.67247   0.30   0.68046   0.29   0.68327   0.11   0.67854   0.58
+   224   0.73024   0.25   0.73962   0.23   0.74123   0.07   0.73863   0.44
+   232   0.79222   0.18   0.80231   0.15   0.80934   0.07   0.80317   0.69
+   240   0.85827   0.12   0.87290   0.11   0.87610   0.07   0.87136   0.68
+   248   0.93168   0.06   0.93886   0.07   0.93897   0.06   0.93707   0.30
+   255   1.00000   0.00   1.00000   0.00   1.00000   0.00   1.00000   0.00
+
+  power-law fit k = (code/255)^γ over codes 16–255:
+    r: γ = 2.348  (worst deviation from the fitted law 17.1%)
+    g: γ = 2.297  (worst deviation from the fitted law 7.0%)
+    b: γ = 2.262  (worst deviation from the fitted law 3.7%)
+    w: γ = 2.276  (worst deviation from the fitted law 3.3%)
+
+WINDOW SIZE (white, photopic relative to the 240 px window; < 1 = loading. 120 px under-fills the i1Pro's collection area and is not a panel effect)
+  brightness 255:  full 0.9122  w360 0.9344  w240 1.0000  w120 0.5275
+  brightness 127:  full 0.9705  w360 0.9809  w240 1.0000  w120 0.5149
+
+BRIGHTNESS REGISTER (spectral scale vs the same patch at 255; equal across channels = separable)
+  191:  r 0.49919 (0.5%)  g 0.51037 (0.5%)  b 0.51899 (0.1%)  w 0.51334 (1.5%)  w128 0.51653 (1.1%)   spread 4.0%   γ_b 2.318
+  127:  r 0.19576 (1.2%)  g 0.20089 (0.9%)  b 0.20424 (0.2%)  w 0.20207 (1.2%)  w128 0.20724 (1.6%)   spread 5.9%   γ_b 2.307
+   63:  r 0.03930 (2.2%)  g 0.04138 (1.5%)  b 0.04266 (0.5%)  w 0.04193 (2.5%)  w128 0.04445 (2.4%)   spread 13.1%   γ_b 2.288
+   31:  r 0.00804 (3.0%)  g 0.00874 (2.3%)  b 0.00915 (1.0%)  w 0.00898 (3.1%)  w128 0.00914 (6.2%)   spread 13.8%   γ_b 2.267
+   15:  r 0.00132 (6.1%)  g 0.00160 (7.9%)  b 0.00196 (2.8%)  w 0.00189 (7.0%)  w128 0.00166 (32.1%)   spread 48.4%   γ_b 2.261
+
+RGB565 (k vs the 24-bit full-drive spectrum, against the 24-bit ramp at the same code)
+  r255: 565 1.00152   888 1.00000   ratio 1.0015
+  g255: 565 0.99971   888 1.00000   ratio 0.9997
+  b255: 565 0.99988   888 1.00000   ratio 0.9999
+  w255: 565 0.99575   888 1.00000   ratio 0.9958
+  r128: 565 0.20879   888 0.19790   ratio 1.0550
+  g128: 565 0.20795   888 0.20149   ratio 1.0320
+  b128: 565 0.22011   888 0.20577   ratio 1.0697
+  w128: 565 0.21563   888 0.20426   ratio 1.0557
+
+TOE (white, full field, averaged readings; ratio = photopic / (that level's full scale × (code/255)^2.28); '—' = the law predicts less than 3× the black readings' scatter, so the reading can't tell)
+  code   b255 ratio   b127 ratio   b063 ratio   b031 ratio
+     1            —            —            —            —
+     2            —            —            —            —
+     3            —            —            —            —
+     4         0.01            —            —            —
+     5         0.12            —            —            —
+     6         0.38            —            —            —
+     7         0.61        -0.28            —            —
+     8         0.69         0.11            —            —
+     9         0.83         0.16            —            —
+    10         0.93         0.22            —            —
+    11         1.09         0.25            —            —
+    12         1.05         0.31            —            —
+    13         1.04         0.40            —            —
+    14         1.04         0.66        -0.01            —
+    15         1.05         0.67        -0.10            —
+    16         1.05         0.73        -0.08            —
+    20                      0.90         0.16            —
+    24                      1.05         0.33            —
+    32                      1.02         0.76            —
+  The cutoff is fixed in absolute light, not code: black to code ~5 at 255, ~8 at 127, ~16 at 63, everything to 32 at 31; indexed by the light the law predicts, the shortfall matches across levels. Model: output = toe(s_b · (code/255)^2.28), one toe function of absolute level — black below ~1/15 000 of full white at 255, on the law above ~1/1 300.
+
+Spectra: mW/(m²·sr·nm) as ArgyllCMS writes them, measured 370–730 nm (zero outside); primaries_1nm.csv covers the cone table's 390–830 nm.
