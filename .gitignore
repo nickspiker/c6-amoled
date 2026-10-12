@@ -27,3 +27,5 @@ target/
 measurements/show/
 *.codes.png
 measurements/*.log
+.venv/
+__pycache__/

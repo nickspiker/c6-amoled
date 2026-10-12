@@ -1,12 +1,17 @@
-//! Bring-up for the Waveshare ESP32-C6-Touch-AMOLED-1.32. Currently runs the colorimetry patch server: line commands over the USB serial link draw measurement patches, each answered with `ok` once the screen is updated, so a host script can step an i1Pro through them.
+//! Firmware for the Waveshare ESP32-C6-Touch-AMOLED-1.32: plays a loop of frames stored in flash, and takes new frames and settings over Wi-Fi (TCP, after a keyed-BLAKE3 challenge) or the USB serial link, which also keeps the colorimetry patch commands.
 //!
-//! Commands (numbers decimal, colour channels 0..=255):
-//! - `f r g b` — fill the whole screen
-//! - `w s r g b` — an s×s square (s even) centred on black
-//! - `b n` — brightness register (51h)
-//! - `m 16|24` — RGB565 or RGB888 interface format
-//! - `i` — followed by one raw RGB888 frame (466 × 466 × 3 bytes), drawn as it arrives
+//! Line commands, the same on both links (numbers decimal, colour channels 0..=255):
+//! - `s n [hash]` — followed by one raw RGB565 disk frame (only the pixels whose centres lie within 233 px of the panel's centre, row by row, high byte first: 341,160 bytes), stored in flash slot n (the `frames` partition, see partitions.csv). The flash work waits for the loop's hold on its newest frame, which stretches to cover it, so the animation never stutters; only that slot is erased and written. With `hash` (the frame's BLAKE3, 64 hex digits), the slot is read back from flash and hashed, and anything short of an exact match is answered `err s n hash …`. Storing into the playing loop's oldest slot moves the loop on by one, so the new frame plays last.
+//! - `p start count ms [hold]` — play slots start, start+1, … wrapping within 0..count, one every `ms`, holding the last (newest) for `hold` ms before looping (default: `ms`). Kept in flash; the board resumes the loop by itself after a power cut.
+//! - `h n` — the BLAKE3 of what slot n holds, to audit the ring
 //! - `ping`
+//!
+//! Over TCP (port 7766, `goes-puck.local`), the board first sends `hello <nonce>`, and nothing but `ping` works until the client answers `auth <BLAKE3 keyed with the shared key, of the nonce>`.
+//!
+//! USB only:
+//! - `wifi <ssid> <password>` — store the network to join and restart; `key <64 hex digits>` — store the shared key; `net` — report the board's address
+//! - `t n` — show slot n once, answering with the flash-map and draw times
+//! - `f r g b` — fill the whole screen; `w s r g b` — an s×s square (s even) centred on black; `b n` — brightness register (51h); `m 16|24` — RGB565 or RGB888 interface format; `i` — followed by one raw RGB888 frame (466 × 466 × 3 bytes), drawn as it arrives. These stop the loop until the next `p`.
 //!
 //! Also kept: the bring-up test patterns and brightness sweep. Patterns: colour bars (RGB order + byte order), ramps (16-bit banding), geometry (column offset + rotation), a single-pixel star field and a 1px checkerboard (does the CO5300's frame-memory compression smear fine detail?), then a moving square for partial-update speed.
 
@@ -19,9 +24,20 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+extern crate alloc;
+
+mod net;
+
+use core::fmt::Write as _;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use c6_amoled::co5300::{Co5300, Format, HEIGHT, WIDTH};
+use c6_amoled::flashmap::Window;
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Timer, with_timeout};
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
@@ -36,16 +52,249 @@ use esp_hal::{
     time::{Instant, Rate},
     timer::timg::TimerGroup,
     usb::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx},
-    Blocking,
+    Async,
 };
 use esp_println::println;
-use static_cell::ConstStaticCell;
+use esp_storage::FlashStorage;
+use static_cell::{ConstStaticCell, StaticCell};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 /// Rows rendered per band. Sized for RGB888 (466 × 32 × 3 = 44,736 bytes); RGB565 bands use the first two thirds and go out as one DMA transfer.
 const BAND_ROWS: u16 = 32;
-static BAND: ConstStaticCell<[u8; WIDTH as usize * BAND_ROWS as usize * 3]> = ConstStaticCell::new([0; WIDTH as usize * BAND_ROWS as usize * 3]);
+const BAND_BYTES: usize = WIDTH as usize * BAND_ROWS as usize * 3;
+/// Word-aligned, since the ROM flash routines read and write through `*u32`.
+#[repr(C, align(4))]
+struct Band([u8; BAND_BYTES]);
+static BAND: ConstStaticCell<Band> = ConstStaticCell::new(Band([0; BAND_BYTES]));
+
+/// First column inside the disk on row y: a pixel is in when its centre lies within 233 px of the panel's centre (the host uses the same test), worked in doubled coordinates so it stays integer. Rows are symmetric, so the span is `start..WIDTH - start`.
+const fn disk_start(y: u16) -> u16 {
+    let d = 2 * y as i32 + 1 - HEIGHT as i32;
+    let r2 = WIDTH as i32 * WIDTH as i32;
+    let mut x = 0;
+    while x < WIDTH / 2 {
+        let e = 2 * x as i32 + 1 - WIDTH as i32;
+        if e * e + d * d <= r2 {
+            break;
+        }
+        x += 1;
+    }
+    x
+}
+
+const DISK_START: [u16; HEIGHT as usize] = {
+    let mut t = [0; HEIGHT as usize];
+    let mut y = 0;
+    while y < HEIGHT {
+        t[y as usize] = disk_start(y);
+        y += 1;
+    }
+    t
+};
+
+/// A stored frame: just the disk's pixels, row by row, RGB565 high byte first.
+const FRAME_BYTES: u32 = {
+    let mut n = 0;
+    let mut y = 0;
+    while y < HEIGHT as usize {
+        n += (WIDTH - 2 * DISK_START[y]) as u32 * 2;
+        y += 1;
+    }
+    n
+};
+const _: () = assert!(FRAME_BYTES % 4 == 0, "flash reads and writes go by whole words");
+
+/// The `frames` partition (partitions.csv): frames packed back to back, so one more fits than if each started on a sector (a slot shares its first and last sector with its neighbours; see `write_slot`), then one sector for the play-settings log.
+const FRAMES_BASE: u32 = 0xB_4000;
+const FRAMES_SIZE: u32 = 0xF4_C000;
+const SLOTS: u16 = ((FRAMES_SIZE - FlashStorage::SECTOR_SIZE) / FRAME_BYTES) as u16;
+const _: () = assert!(SLOTS == 47, "partitions.csv no longer leaves room for 47 frames");
+/// MMU pages to map one slot, which needn't start on a page.
+const MAP_PAGES: u32 = FRAME_BYTES.div_ceil(FlashStorage::BLOCK_SIZE) + 1;
+/// Rows per rectangle when covering the disk; even, as CO5300 windows must be.
+const STRIP_ROWS: u16 = 32;
+
+/// A loop: slots `start`, `start + 1`, … wrapping within `0..count`, one every `ms`, the last held for `hold` ms.
+#[derive(Clone, Copy, PartialEq)]
+struct PlaySettings {
+    start: u16,
+    count: u16,
+    ms: u16,
+    hold: u16,
+}
+
+/// The play settings survive power cuts as a log in the frames partition's tail, in the first whole sector past the last slot: 16-byte records appended in order, and once the sector is full it's erased and the log starts over, so it's erased once per 256 changes rather than once per change.
+const LOG_BASE: u32 = (FRAMES_BASE + SLOTS as u32 * FRAME_BYTES).div_ceil(FlashStorage::SECTOR_SIZE) * FlashStorage::SECTOR_SIZE;
+const LOG_END: u32 = FRAMES_BASE + FRAMES_SIZE;
+const RECORD: u32 = 16;
+const MAGIC: u32 = 0x504C_4159;
+const _: () = assert!(LOG_END - LOG_BASE >= FlashStorage::SECTOR_SIZE, "no room left for the play-settings log");
+
+impl PlaySettings {
+    fn words(self) -> [u32; 4] {
+        let (a, b) = (self.start as u32 | (self.count as u32) << 16, self.ms as u32 | (self.hold as u32) << 16);
+        [MAGIC, a, b, a ^ b ^ 0xA5A5_A5A5]
+    }
+
+    fn from_words(w: [u32; 4]) -> Option<PlaySettings> {
+        let s = PlaySettings { start: w[1] as u16, count: (w[1] >> 16) as u16, ms: w[2] as u16, hold: (w[2] >> 16) as u16 };
+        (w[0] == MAGIC && w[3] == w[1] ^ w[2] ^ 0xA5A5_A5A5 && s.count >= 1 && s.count <= SLOTS && s.start < s.count).then_some(s)
+    }
+}
+
+/// Scan the log: the last valid record and where the next one goes (the first erased word).
+fn load_log(flash: &mut FlashStorage, band: &mut [u8]) -> (Option<PlaySettings>, u32) {
+    let mut saved = None;
+    let mut at = LOG_BASE;
+    while at < LOG_END {
+        let chunk = &mut band[..FlashStorage::SECTOR_SIZE as usize];
+        if flash.read_nor(at, chunk).is_err() {
+            return (saved, LOG_END);
+        }
+        for r in chunk.chunks_exact(RECORD as usize) {
+            let w = [0, 4, 8, 12].map(|i| u32::from_le_bytes([r[i], r[i + 1], r[i + 2], r[i + 3]]));
+            if w[0] == u32::MAX {
+                return (saved, at);
+            }
+            saved = PlaySettings::from_words(w).or(saved);
+            at += RECORD;
+        }
+    }
+    (saved, at)
+}
+
+/// Network and shared key, kept in the first sector of the `nvs` partition (nothing else here uses NVS).
+#[derive(Clone)]
+struct Settings {
+    ssid: heapless::String<32>,
+    password: heapless::String<64>,
+    key: Option<[u8; 32]>,
+}
+
+const SETTINGS_ADDR: u32 = 0x9000;
+const SETTINGS_MAGIC: u32 = 0x4E45_5431;
+/// Magic, lengths, SSID (32 bytes), password (64), key (32).
+const SETTINGS_WORDS: usize = 34;
+
+impl Settings {
+    fn load(flash: &mut FlashStorage) -> Settings {
+        let mut w = [0u32; SETTINGS_WORDS];
+        // SAFETY: the u32 array viewed as its bytes, word-aligned as the ROM read needs.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(w.as_mut_ptr() as *mut u8, SETTINGS_WORDS * 4) };
+        let empty = Settings { ssid: heapless::String::new(), password: heapless::String::new(), key: None };
+        if flash.read_nor(SETTINGS_ADDR, bytes).is_err() || w[0] != SETTINGS_MAGIC {
+            return empty;
+        }
+        let (ssid_len, pass_len, has_key) = ((w[1] & 0xFF) as usize, (w[1] >> 8 & 0xFF) as usize, w[1] >> 16 & 1 == 1);
+        let ssid = core::str::from_utf8(&bytes[8..8 + ssid_len.min(32)]).ok().and_then(|s| s.try_into().ok());
+        let password = core::str::from_utf8(&bytes[40..40 + pass_len.min(64)]).ok().and_then(|s| s.try_into().ok());
+        let (Some(ssid), Some(password)) = (ssid, password) else {
+            return empty;
+        };
+        let key = has_key.then(|| bytes[104..136].try_into().unwrap());
+        Settings { ssid, password, key }
+    }
+
+    fn save(&self, flash: &mut FlashStorage) -> bool {
+        let mut w = [0u32; SETTINGS_WORDS];
+        // SAFETY: as in `load`.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(w.as_mut_ptr() as *mut u8, SETTINGS_WORDS * 4) };
+        bytes[8..8 + self.ssid.len()].copy_from_slice(self.ssid.as_bytes());
+        bytes[40..40 + self.password.len()].copy_from_slice(self.password.as_bytes());
+        if let Some(k) = self.key {
+            bytes[104..136].copy_from_slice(&k);
+        }
+        w[0] = SETTINGS_MAGIC;
+        w[1] = self.ssid.len() as u32 | (self.password.len() as u32) << 8 | (self.key.is_some() as u32) << 16;
+        let bytes = unsafe { core::slice::from_raw_parts(w.as_ptr() as *const u8, SETTINGS_WORDS * 4) };
+        flash.erase(SETTINGS_ADDR, SETTINGS_ADDR + FlashStorage::SECTOR_SIZE).is_ok() && flash.write_nor(SETTINGS_ADDR, bytes).is_ok()
+    }
+}
+
+/// Everything the tasks share: the panel, the flash store and what's playing.
+struct Board {
+    lcd: Co5300<'static>,
+    band: &'static mut [u8],
+    flash: FlashStorage<'static>,
+    window: Window,
+    /// Next free record in the play-settings log, and the settings it last recorded.
+    log: u32,
+    saved: Option<PlaySettings>,
+    /// The loop on screen; `None` while a patch command has the panel.
+    playing: Option<PlaySettings>,
+    settings: Settings,
+}
+
+type Shared = Mutex<CriticalSectionRawMutex, Board>;
+static BOARD: StaticCell<Shared> = StaticCell::new();
+/// The player waits on this while stopped.
+static PLAY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// A store waiting for the loop's hold; the player answers with `AT_HOLD` and holds until `STORE_DONE`.
+static STORE_WANTED: AtomicBool = AtomicBool::new(false);
+static AT_HOLD: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static STORE_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+impl Board {
+    /// Start (or change) the loop, recording it in the log unless it's what the log already holds.
+    fn play(&mut self, s: PlaySettings) {
+        self.playing = Some(s);
+        PLAY.signal(());
+        if self.saved == Some(s) {
+            return;
+        }
+        if self.log + RECORD > LOG_END {
+            if self.flash.erase(LOG_BASE, LOG_END).is_err() {
+                return;
+            }
+            self.log = LOG_BASE;
+        }
+        let words = s.words();
+        // SAFETY: four u32s viewed as their 16 bytes; the pointer stays word-aligned, as the ROM write needs.
+        let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, RECORD as usize) };
+        if self.flash.write_nor(self.log, bytes).is_ok() {
+            self.log += RECORD;
+            self.saved = Some(s);
+        }
+    }
+
+    /// The cache-mapped bytes of slot n.
+    fn slot(&mut self, slot: u16) -> &[u8] {
+        let base = FRAMES_BASE + slot as u32 * FRAME_BYTES;
+        let page = base & !(FlashStorage::BLOCK_SIZE - 1);
+        &self.window.map(page)[(base - page) as usize..][..FRAME_BYTES as usize]
+    }
+
+    /// Draw slot n on the panel (already in RGB565 mode) from the cache-mapped flash. The CO5300 only takes rectangles, so the disk goes out as strips of STRIP_ROWS rows, each as wide as its widest row (rounded out to even); each row's disk pixels are copied from flash into the band buffer between black margins. Returns the microseconds to map the slot and to draw it.
+    fn show_slot(&mut self, slot: u16) -> (u64, u64) {
+        let t = Instant::now();
+        let base = FRAMES_BASE + slot as u32 * FRAME_BYTES;
+        let page = base & !(FlashStorage::BLOCK_SIZE - 1);
+        let src = &self.window.map(page)[(base - page) as usize..][..FRAME_BYTES as usize];
+        let t2 = Instant::now();
+        let (mut y, mut off) = (0, 0);
+        while y < HEIGHT {
+            let rows = STRIP_ROWS.min(HEIGHT - y);
+            let x0 = DISK_START[y as usize..(y + rows) as usize].iter().copied().min().unwrap_or(0) & !1;
+            let mut i = 0;
+            for yy in y..y + rows {
+                let s = DISK_START[yy as usize];
+                let margin = (s - x0) as usize * 2;
+                let n = (WIDTH - 2 * s) as usize * 2;
+                self.band[i..i + margin].fill(0);
+                self.band[i + margin..i + margin + n].copy_from_slice(&src[off..off + n]);
+                self.band[i + margin + n..i + 2 * margin + n].fill(0);
+                i += 2 * margin + n;
+                off += n;
+            }
+            self.lcd.begin(x0, y, WIDTH - 2 * x0, rows);
+            self.lcd.push(&self.band[..i]);
+            self.lcd.end();
+            y += rows;
+        }
+        ((t2 - t).as_micros(), t2.elapsed().as_micros())
+    }
+}
 
 const fn rgb(r: u8, g: u8, b: u8) -> u16 {
     ((r as u16 >> 3) << 11) | ((g as u16 >> 2) << 5) | (b as u16 >> 3)
@@ -54,10 +303,14 @@ const fn rgb(r: u8, g: u8, b: u8) -> u16 {
 const BLACK: u16 = 0;
 const WHITE: u16 = rgb(255, 255, 255);
 
+
 #[allow(clippy::large_stack_frames, reason = "it's not unusual to allocate larger buffers etc. in main")]
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+    // The Wi-Fi driver allocates; give it the RAM the bootloader used, plus a little more.
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 32 * 1024);
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
@@ -77,100 +330,453 @@ async fn main(_spawner: Spawner) -> ! {
     let mut rst = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
     let delay = Delay::new();
     let mut lcd = Co5300::new(spi, cs, &mut rst, &delay);
-    let band = BAND.take();
-    let (mut rx, _tx) = UsbSerialJtag::new(peripherals.USB_DEVICE).split();
-    println!("CO5300 up: 466x466, QSPI 40 MHz");
-    patch_server(&mut lcd, band, &mut rx).await
+    lcd.set_format(Format::Rgb888);
+    let band = &mut BAND.take().0;
+    fill_rgb(&mut lcd, band, 0, (0, 0, 0));
+    let mut flash = FlashStorage::new(peripherals.FLASH);
+    let mut window = Window::claim(MAP_PAGES).expect("no free MMU entries for a frame slot");
+    // Self-check: the app image at 0x10000 starts with the ESP image magic, 0xE9.
+    assert_eq!(window.map(0x1_0000)[0], 0xE9, "flash mapping isn't where expected");
+    let (saved, log) = load_log(&mut flash, band);
+    let settings = Settings::load(&mut flash);
+    println!("CO5300 up: 466x466, QSPI 40 MHz; {SLOTS} frame slots of {FRAME_BYTES} bytes, read through the cache");
+    if let Some(s) = saved {
+        println!("resuming loop: {} frames from slot {}", s.count, s.start);
+    }
+    let wifi = settings.clone();
+    let board = BOARD.init(Mutex::new(Board { lcd, band, flash, window, log, saved, playing: saved, settings }));
+    spawner.spawn(player(board).expect("player task"));
+    if wifi.ssid.is_empty() {
+        println!("no Wi-Fi network set: `wifi <ssid> <password>` over USB");
+    } else {
+        net::start(&spawner, peripherals.WIFI, &wifi.ssid, &wifi.password, board);
+    }
+
+    let (rx, _tx) = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async().split();
+    let mut usb = Conn::new(UsbIo(rx));
+    println!("ready");
+    loop {
+        let _ = serve(&mut usb, board, true).await;
+    }
 }
 
-/// Read line commands from the USB serial link and draw measurement patches; see the module docs for the command set. Every command is answered with `ok …` once the panel holds the new image, or `err …`.
-async fn patch_server(lcd: &mut Co5300<'_>, band: &mut [u8], rx: &mut UsbSerialJtagRx<'_, Blocking>) -> ! {
-    lcd.set_format(Format::Rgb888);
-    fill_rgb(lcd, band, 0, (0, 0, 0));
-    println!("ready");
-    let mut line = [0u8; 64];
-    let mut n = 0;
+/// Plays the loop: one frame every `ms`, then the newest held for `hold` — and, if a store is waiting, held until it's done, so all flash work happens while the picture is still.
+#[embassy_executor::task]
+async fn player(board: &'static Shared) {
+    let mut current: Option<PlaySettings> = None;
+    let mut i = 0u16;
+    let mut next = embassy_time::Instant::now();
     loop {
-        match rx.read_byte() {
-            Ok(b'\n' | b'\r') => {
-                if n > 0 {
-                    if &line[..n] == b"i" {
-                        receive_image(lcd, band, rx);
-                    } else {
-                        command(lcd, band, &line[..n]);
+        let shown = {
+            let mut b = board.lock().await;
+            match b.playing {
+                None => None,
+                Some(s) => {
+                    if current != Some(s) {
+                        if current.is_none() {
+                            b.lcd.set_format(Format::Rgb565);
+                            next = embassy_time::Instant::now();
+                        }
+                        current = Some(s);
+                        i = 0;
                     }
-                    n = 0;
+                    b.show_slot((s.start + i) % s.count);
+                    Some((s, i == s.count - 1))
                 }
             }
-            Ok(b) if n < line.len() => {
-                line[n] = b;
-                n += 1;
+        };
+        let Some((s, last)) = shown else {
+            current = None;
+            PLAY.wait().await;
+            continue;
+        };
+        if last {
+            let held_from = embassy_time::Instant::now();
+            if STORE_WANTED.load(Ordering::Acquire) {
+                STORE_DONE.reset();
+                AT_HOLD.signal(());
+                STORE_DONE.wait().await;
             }
-            Ok(_) => {}
-            Err(_) => Timer::after(Duration::from_millis(1)).await,
+            next = held_from + Duration::from_millis(s.hold as u64);
+            i = 0;
+        } else {
+            next += Duration::from_millis(s.ms as u64);
+            i += 1;
+        }
+        let now = embassy_time::Instant::now();
+        if next > now {
+            Timer::at(next).await;
+        } else {
+            next = now;
         }
     }
 }
 
-/// `i`: read exactly one full frame of raw RGB888 (466 × 466 × 3 bytes, row-major, R G B) from the serial link and stream it to the panel band by band as it arrives. Answers `ok i`, or `err i …` if the panel isn't in 24-bit mode or the data stalls for 5 s (the partial frame stays on screen).
-fn receive_image(lcd: &mut Co5300, band: &mut [u8], rx: &mut UsbSerialJtagRx<'_, Blocking>) {
-    if lcd.format() != Format::Rgb888 {
-        println!("err i needs m 24");
-        return;
+/// A byte stream the command protocol runs over: the USB serial link or a TCP connection.
+trait Io {
+    /// Read at least one byte; `Err` once the link is gone.
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()>;
+    async fn write(&mut self, data: &[u8]) -> Result<(), ()>;
+}
+
+struct UsbIo(UsbSerialJtagRx<'static, Async>);
+
+impl Io for UsbIo {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
+        embedded_io_async::Read::read(&mut self.0, buf).await.map_err(|_| ())
+    }
+
+    async fn write(&mut self, data: &[u8]) -> Result<(), ()> {
+        esp_println::Printer::write_bytes(data);
+        Ok(())
+    }
+}
+
+/// Longest command line: `s nn` and a 64-digit hash, with room to spare.
+const LINE: usize = 112;
+
+/// One received command line.
+struct Line {
+    buf: [u8; LINE],
+    len: usize,
+}
+
+impl Line {
+    fn text(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// A link with a small read buffer, so a command line and the frame data right behind it can arrive in any chunking.
+struct Conn<T> {
+    io: T,
+    buf: [u8; 256],
+    at: usize,
+    end: usize,
+}
+
+impl<T: Io> Conn<T> {
+    fn new(io: T) -> Self {
+        Conn { io, buf: [0; 256], at: 0, end: 0 }
+    }
+
+    async fn byte(&mut self) -> Result<u8, ()> {
+        if self.at == self.end {
+            let n = self.io.read(&mut self.buf).await?;
+            if n == 0 {
+                return Err(());
+            }
+            (self.at, self.end) = (0, n);
+        }
+        self.at += 1;
+        Ok(self.buf[self.at - 1])
+    }
+
+    /// The next non-empty line, without its line ending; overlong lines are cut at LINE bytes.
+    async fn line(&mut self) -> Result<Line, ()> {
+        let mut line = Line { buf: [0; LINE], len: 0 };
+        loop {
+            match self.byte().await? {
+                b'\n' | b'\r' if line.len > 0 => return Ok(line),
+                b'\n' | b'\r' => {}
+                b if line.len < LINE => {
+                    line.buf[line.len] = b;
+                    line.len += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Fill `out` exactly: whatever's buffered first, then straight from the link.
+    async fn read_exact(&mut self, out: &mut [u8]) -> Result<(), ()> {
+        let have = (self.end - self.at).min(out.len());
+        out[..have].copy_from_slice(&self.buf[self.at..self.at + have]);
+        self.at += have;
+        let mut got = have;
+        while got < out.len() {
+            let n = self.io.read(&mut out[got..]).await?;
+            if n == 0 {
+                return Err(());
+            }
+            got += n;
+        }
+        Ok(())
+    }
+
+    async fn reply(&mut self, args: core::fmt::Arguments<'_>) -> Result<(), ()> {
+        let mut s = heapless::String::<160>::new();
+        let _ = s.write_fmt(args);
+        let _ = s.push('\n');
+        self.io.write(s.as_bytes()).await
+    }
+}
+
+/// Hex digits, lowercase.
+struct Hex<'a>(&'a [u8]);
+
+impl core::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+/// Answer commands on one link until it drops. `usb` is the trusted local link: no challenge, and the setup and patch commands are allowed.
+async fn serve<T: Io>(conn: &mut Conn<T>, board: &'static Shared, usb: bool) -> Result<(), ()> {
+    let mut nonce = [0u8; 32];
+    let mut authed = usb;
+    if !usb {
+        esp_hal::rng::Rng::new().read(&mut nonce);
+        conn.reply(format_args!("hello {}", Hex(&nonce))).await?;
+    }
+    loop {
+        let line = conn.line().await?;
+        let Ok(text) = core::str::from_utf8(line.text()) else {
+            conn.reply(format_args!("err utf8")).await?;
+            continue;
+        };
+        let mut words = text.split_ascii_whitespace();
+        let op = words.next().unwrap_or("");
+        match op {
+            "ping" => conn.reply(format_args!("ok ping")).await?,
+            "auth" if !usb => {
+                let key = board.lock().await.settings.key;
+                let answer = words.next().and_then(unhex32);
+                authed = matches!((key, answer), (Some(k), Some(a)) if blake3::keyed_hash(&k, &nonce) == blake3::Hash::from_bytes(a));
+                conn.reply(format_args!("{} auth", if authed { "ok" } else { "err" })).await?;
+            }
+            _ if !authed => conn.reply(format_args!("err auth first")).await?,
+            "s" => match parse_store(text) {
+                Some((Some(slot), hash)) if slot < SLOTS => store(conn, board, slot, hash).await?,
+                _ => conn.reply(format_args!("err {text}")).await?,
+            },
+            "p" => match numbers::<4>(words) {
+                Some((a, n)) if (n == 3 || n == 4) && a[1] >= 1 && a[1] <= SLOTS && a[0] < a[1] => {
+                    board.lock().await.play(PlaySettings { start: a[0], count: a[1], ms: a[2], hold: if n == 4 { a[3] } else { a[2] } });
+                    conn.reply(format_args!("ok p")).await?;
+                }
+                _ => conn.reply(format_args!("err {text}")).await?,
+            },
+            "h" => match numbers::<1>(words) {
+                Some((a, 1)) if a[0] < SLOTS => {
+                    let hash = blake3::hash(board.lock().await.slot(a[0]));
+                    conn.reply(format_args!("ok h {} {}", a[0], Hex(hash.as_bytes()))).await?;
+                }
+                _ => conn.reply(format_args!("err {text}")).await?,
+            },
+            _ if !usb => conn.reply(format_args!("err {text}")).await?,
+            "wifi" => {
+                let (Some(ssid), Some(pass), None) = (words.next(), words.next(), words.next()) else {
+                    conn.reply(format_args!("err wifi <ssid> <password>")).await?;
+                    continue;
+                };
+                let mut b = board.lock().await;
+                let (Ok(ssid), Ok(password)) = (ssid.try_into(), pass.try_into()) else {
+                    conn.reply(format_args!("err wifi: ssid ≤ 32 bytes, password ≤ 64")).await?;
+                    continue;
+                };
+                b.settings.ssid = ssid;
+                b.settings.password = password;
+                let ok = { let s = b.settings.clone(); s.save(&mut b.flash) };
+                conn.reply(format_args!("{} wifi; restarting", if ok { "ok" } else { "err" })).await?;
+                Timer::after(Duration::from_millis(100)).await;
+                esp_hal::system::software_reset();
+            }
+            "key" => match (words.next().and_then(unhex32), words.next()) {
+                (Some(k), None) => {
+                    let mut b = board.lock().await;
+                    b.settings.key = Some(k);
+                    let ok = { let s = b.settings.clone(); s.save(&mut b.flash) };
+                    conn.reply(format_args!("{} key", if ok { "ok" } else { "err" })).await?;
+                }
+                _ => conn.reply(format_args!("err key <64 hex digits>")).await?,
+            },
+            "net" => {
+                let ip = net::address();
+                conn.reply(format_args!("ok net {}", ip.map_or(heapless::String::<16>::new(), |a| { let mut s = heapless::String::new(); let _ = write!(s, "{a}"); s }))).await?;
+            }
+            "t" => match numbers::<1>(words) {
+                Some((a, 1)) if a[0] < SLOTS => {
+                    let mut b = board.lock().await;
+                    b.playing = None;
+                    b.lcd.set_format(Format::Rgb565);
+                    let (map, draw) = b.show_slot(a[0]);
+                    drop(b);
+                    conn.reply(format_args!("ok t {} map {map} us draw {draw} us", a[0])).await?;
+                }
+                _ => conn.reply(format_args!("err {text}")).await?,
+            },
+            "i" => receive_image(conn, board).await?,
+            _ => {
+                let mut b = board.lock().await;
+                b.playing = None;
+                let b = &mut *b;
+                command(&mut b.lcd, b.band, text);
+            }
+        }
+    }
+}
+
+/// Up to N decimal arguments: the values and how many there were, or `None` if one isn't a number or there are too many.
+fn numbers<'a, const N: usize>(words: impl Iterator<Item = &'a str>) -> Option<([u16; N], usize)> {
+    let mut a = [0u16; N];
+    let mut n = 0;
+    for w in words {
+        if n == N {
+            return None;
+        }
+        a[n] = w.parse().ok()?;
+        n += 1;
+    }
+    Some((a, n))
+}
+
+/// `s n [hash]`: `None` if the line isn't an `s` command; otherwise the slot (`None` if malformed) and the optional BLAKE3 hash.
+fn parse_store(text: &str) -> Option<(Option<u16>, Option<[u8; 32]>)> {
+    let mut words = text.split_ascii_whitespace();
+    if words.next() != Some("s") {
+        return None;
+    }
+    let slot = words.next().and_then(|w| w.parse::<u16>().ok());
+    let hash = match words.next() {
+        None => None,
+        Some(hex) => match unhex32(hex) {
+            Some(h) => Some(h),
+            None => return Some((None, None)),
+        },
+    };
+    if words.next().is_some() {
+        return Some((None, None));
+    }
+    Some((slot, hash))
+}
+
+fn unhex32(hex: &str) -> Option<[u8; 32]> {
+    let digits = hex.as_bytes();
+    if digits.len() != 64 {
+        return None;
+    }
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let mut out = [0u8; 32];
+    for (i, pair) in digits.chunks_exact(2).enumerate() {
+        out[i] = nibble(pair[0])? << 4 | nibble(pair[1])?;
+    }
+    Some(out)
+}
+
+/// `s n [hash]`: store one frame into slot n. The flash work waits for the loop to reach its hold on the newest frame (the player holds until it's done), so the animation never stutters; the frame's bytes stream in meanwhile as fast as the flash takes them. Answers `ok s n`, or `err s …`; the link only fails on a dropped connection.
+async fn store<T: Io>(conn: &mut Conn<T>, board: &'static Shared, slot: u16, hash: Option<[u8; 32]>) -> Result<(), ()> {
+    let playing = board.lock().await.playing.is_some();
+    if playing {
+        AT_HOLD.reset();
+        STORE_WANTED.store(true, Ordering::Release);
+        // A whole pass is at most 47 frames plus the hold; don't wait forever if the player is somehow stuck.
+        let _ = with_timeout(Duration::from_secs(15), AT_HOLD.wait()).await;
+    }
+    let result = write_slot(conn, board, slot, hash).await;
+    if playing {
+        STORE_WANTED.store(false, Ordering::Release);
+        STORE_DONE.signal(());
+    }
+    match result {
+        Ok(Ok(())) => conn.reply(format_args!("ok s {slot}")).await,
+        Ok(Err(why)) => conn.reply(format_args!("err s {slot} {why}")).await,
+        Err(()) => Err(()),
+    }
+}
+
+/// Erase slot n, stream FRAME_BYTES into it a 4 KiB page at a time, then (with a hash) read it back through the cache and check its BLAKE3. Storing into the playing loop's first slot (its oldest frame) moves the loop on by one, so the new frame plays last. Outer `Err`: the link failed; inner: why the store did.
+async fn write_slot<T: Io>(conn: &mut Conn<T>, board: &'static Shared, slot: u16, hash: Option<[u8; 32]>) -> Result<Result<(), &'static str>, ()> {
+    #[repr(C, align(4))]
+    struct Page([u8; 4096]);
+    let base = FRAMES_BASE + slot as u32 * FRAME_BYTES;
+    if !erase_slot(&mut *board.lock().await, base) {
+        return Ok(Err("erase failed"));
+    }
+    let mut page = Page([0; 4096]);
+    let mut got = 0;
+    while got < FRAME_BYTES {
+        let n = (FRAME_BYTES - got).min(4096) as usize;
+        match with_timeout(Duration::from_secs(10), conn.read_exact(&mut page.0[..n])).await {
+            Ok(r) => r?,
+            Err(_) => return Ok(Err("stalled")),
+        }
+        if board.lock().await.flash.write_nor(base + got, &page.0[..n]).is_err() {
+            return Ok(Err("write failed"));
+        }
+        got += n as u32;
+    }
+    let mut b = board.lock().await;
+    if let Some(want) = hash {
+        if blake3::hash(b.slot(slot)) != blake3::Hash::from_bytes(want) {
+            return Ok(Err("hash mismatch"));
+        }
+    }
+    if let Some(s) = b.playing {
+        if s.start == slot {
+            b.play(PlaySettings { start: (slot + 1) % s.count, ..s });
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// Erase the sectors under the frame at `base`. Slots are packed, so the first and last sector also hold the neighbouring frames' edges: those bytes are kept in the band buffer (free during the hold) and written straight back.
+fn erase_slot(b: &mut Board, base: u32) -> bool {
+    const SECTOR: u32 = FlashStorage::SECTOR_SIZE;
+    let (first, end) = (base / SECTOR * SECTOR, (base + FRAME_BYTES).div_ceil(SECTOR) * SECTOR);
+    let (head, tail) = ((base - first) as usize, (end - base - FRAME_BYTES) as usize);
+    let tail_at = base + FRAME_BYTES;
+    let band = &mut *b.band;
+    // Both edges are whole words: sectors and frames are multiples of 4 bytes.
+    let saved = b.flash.read_nor(first, &mut band[..head]).is_ok() && b.flash.read_nor(tail_at, &mut band[SECTOR as usize..SECTOR as usize + tail]).is_ok();
+    saved
+        && b.flash.erase(first, end).is_ok()
+        && b.flash.write_nor(first, &band[..head]).is_ok()
+        && b.flash.write_nor(tail_at, &band[SECTOR as usize..SECTOR as usize + tail]).is_ok()
+}
+
+/// `i`: read exactly one full frame of raw RGB888 (466 × 466 × 3 bytes, row-major, R G B) and stream it to the panel band by band as it arrives. Stops the loop. Answers `ok i`, or `err i …` if the panel isn't in 24-bit mode or the data stalls for 5 s (the partial frame stays on screen).
+async fn receive_image<T: Io>(conn: &mut Conn<T>, board: &'static Shared) -> Result<(), ()> {
+    let mut guard = board.lock().await;
+    let b = &mut *guard;
+    b.playing = None;
+    if b.lcd.format() != Format::Rgb888 {
+        return conn.reply(format_args!("err i needs m 24")).await;
     }
     let total = WIDTH as usize * HEIGHT as usize * 3;
     let band_bytes = WIDTH as usize * BAND_ROWS as usize * 3;
-    lcd.begin(0, 0, WIDTH, HEIGHT);
-    let (mut got, mut fill) = (0usize, 0usize);
-    let mut last = Instant::now();
+    b.lcd.begin(0, 0, WIDTH, HEIGHT);
+    let mut got = 0;
     while got < total {
-        let want = (band_bytes - fill).min(total - got);
-        let n = rx.drain_rx_fifo(&mut band[fill..fill + want]);
-        if n == 0 {
-            if last.elapsed().as_millis() > 5000 {
-                lcd.end();
-                println!("err i stalled at {got} of {total} bytes");
-                return;
+        let n = band_bytes.min(total - got);
+        match with_timeout(Duration::from_secs(5), conn.read_exact(&mut b.band[..n])).await {
+            Ok(r) => r?,
+            Err(_) => {
+                b.lcd.end();
+                return conn.reply(format_args!("err i stalled at {got} of {total} bytes")).await;
             }
-            continue;
         }
-        last = Instant::now();
-        fill += n;
+        b.lcd.push(&b.band[..n]);
         got += n;
-        if fill == band_bytes || got == total {
-            lcd.push(&band[..fill]);
-            fill = 0;
-        }
     }
-    lcd.end();
-    println!("ok i");
+    b.lcd.end();
+    conn.reply(format_args!("ok i")).await
 }
 
-/// Parse and run one patch-server command.
-fn command(lcd: &mut Co5300, band: &mut [u8], line: &[u8]) {
-    let Ok(text) = core::str::from_utf8(line) else {
-        println!("err utf8");
-        return;
-    };
+/// Run one of the USB patch commands, answering over USB.
+fn command(lcd: &mut Co5300, band: &mut [u8], text: &str) {
     let mut words = text.split_ascii_whitespace();
     let op = words.next().unwrap_or("");
-    let mut args = [0u16; 4];
-    let mut count = 0;
-    for w in words {
-        match w.parse::<u16>() {
-            Ok(v) if count < args.len() => {
-                args[count] = v;
-                count += 1;
-            }
-            _ => {
-                println!("err arg {w}");
-                return;
-            }
-        }
-    }
+    let Some((args, count)) = numbers::<4>(words) else {
+        println!("err {text}");
+        return;
+    };
     let channel = |v: u16| v.min(255) as u8;
     match (op, count) {
-        ("ping", 0) => {}
         ("f", 3) => fill_rgb(lcd, band, WIDTH, (channel(args[0]), channel(args[1]), channel(args[2]))),
         ("w", 4) if args[0] % 2 == 0 && args[0] >= 2 && args[0] <= WIDTH - 2 => fill_rgb(lcd, band, args[0], (channel(args[1]), channel(args[2]), channel(args[3]))),
         ("b", 1) => lcd.set_brightness(channel(args[0])),
