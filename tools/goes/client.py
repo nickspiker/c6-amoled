@@ -1,6 +1,6 @@
 """The satellite face's PC side, first slice: fetch a GOES-18 frame, map bands straight onto the panel primaries, and put it on the panel.
 
-Mapping: band 9 → red, 7 → green, 6 → blue, each linear in absolute radiance between that band's black and white, drive = (L − black) / (white − black), clipped independently. The subtraction is on radiance, which is linear in light; the panel model applies the gamma afterwards. Both ends ratchet on robust per-frame statistics over the disk (so a lone fire pixel or dead sample can't swing a channel): white only ever rises, to a frame's 99.99th percentile when that beats it; black only ever falls, to a frame's 0.01th percentile. Whites start from the June 2026 solstice sample (white.py: blue at its p99.9, green at 330 K, red at 260 K); black starts at the first frame's. State and every move are kept in ~/.local/state/c6-amoled/white.json; each frame's radiances are cached in ~/.cache/c6-amoled/frames/ while the board's ring holds that frame.
+Mapping: band 9 → red, 7 → green, 6 → blue, each linear in absolute radiance between that band's black and white, drive = (L − black) / (white − black), clipped independently. The subtraction is on radiance, which is linear in light; the panel model applies the gamma afterwards. Both ends ratchet on robust per-frame statistics over the disk (so a lone fire pixel or dead sample can't swing a channel): white only ever rises, to a frame's 99.99th percentile when that beats it; black only ever falls, to a frame's 0.01th percentile. Whites start from the June 2026 solstice sample (white.py: blue at its p99.9, green at 330 K, red at 260 K); black starts at the first frame's. State and every move are kept in state/white.json (repo root, git-ignored); each frame's radiances are cached in cache/frames/ while the board's ring holds that frame.
 
 Usage:
   .venv/bin/python client.py [--at 2026-10-12T01:20] [--depth 565|888] [port]
@@ -22,9 +22,11 @@ from blake3 import blake3
 from bands import MEASURE, N, equivalent, find_frame, list_keys, read_band, write_png16
 
 MAP = {"R": 9, "G": 7, "B": 6}
-STATE = Path.home() / ".local/state/c6-amoled/white.json"
-RING = STATE.parent / "ring.json"
-CACHE = Path.home() / ".cache/c6-amoled"
+# Everything persistent lives on /mnt/Harbor, never in ~ (wiped daily): state and cache in the repo (git-ignored), the key with the other keys.
+REPO = Path(__file__).resolve().parents[2]
+STATE = REPO / "state/white.json"
+RING = REPO / "state/ring.json"
+CACHE = REPO / "cache"
 FRAMES = CACHE / "frames"
 WORK = CACHE / "work"
 # The encoder, built ahead (`cargo build --release` in tools/measure), so the service doesn't need cargo.

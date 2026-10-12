@@ -29,3 +29,5 @@ measurements/show/
 measurements/*.log
 .venv/
 __pycache__/
+state/
+cache/

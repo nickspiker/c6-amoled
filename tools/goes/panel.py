@@ -2,7 +2,7 @@
 
 Two transports, one interface:
 - a serial device path (`/dev/serial/by-id/…`): the USB link, trusted, also for setup (`wifi`, `key`)
-- `tcp://host:port` (normally `tcp://goes-puck.local:7766`): Wi-Fi, after answering the board's challenge with a BLAKE3 keyed by the shared key in ~/.config/c6-amoled/key
+- `tcp://host:port` (normally `tcp://goes-puck.local:7766`): Wi-Fi, after answering the board's challenge with a BLAKE3 keyed by the shared key in /mnt/Harbor/Code/keys/goes-puck.key
 """
 
 import os
@@ -16,7 +16,7 @@ from pathlib import Path
 
 from blake3 import blake3
 
-KEY = Path.home() / ".config/c6-amoled/key"
+KEY = Path("/mnt/Harbor/Code/keys/goes-puck.key")
 
 
 def shared_key():
