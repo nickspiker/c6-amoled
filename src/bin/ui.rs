@@ -1,4 +1,4 @@
-//! The touch screen and the brightness readout: drag up or down anywhere to step through 144 brightness levels, shown while you adjust as two dozenal digits (Oxanium with the Zil..Stelor glyphs) on a soft dark disc over the loop. Text is blended in linear light through the panel's measured response, integers only.
+//! The touch screen and the brightness readout: drag up or down anywhere to step through 144 brightness levels, shown while you adjust as two dozenal digits (Oxanium with the Zil..Stelor glyphs) on a soft dark disc over the loop, with the Wi-Fi signal strength as one more digit below them, from red Zil (−80 dBm or worse, or not connected) through yellow to green Stelor (−40 dBm or better). Text is blended in linear light through the panel's measured response, integers only.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
@@ -107,10 +107,27 @@ impl Font {
     }
 }
 
-/// The readout: digit coverage on a canvas around the panel's centre, a dark disc behind it, and how far it has faded in (0 hidden .. 15 full). Its buffers are static: the heap is small and mostly the Wi-Fi driver's.
+/// The signal-strength digit for `rssi` (dBm): Zil at −80 or worse (or not connected) up to Stelor at −40 or better, evenly spaced in dB (about 3.6 dB a step).
+pub fn signal_digit(rssi: Option<i32>) -> u8 {
+    match rssi {
+        None => 0,
+        Some(r) => (((r + 80).clamp(0, 40) * 11 + 20) / 40) as u8,
+    }
+}
+
+/// The signal digit's colour, as linear light per channel (0..=65535): red at Zil, through yellow (red and green both full) at the middle, to green at Stelor.
+fn signal_colour(digit: u8) -> [u32; 3] {
+    let d = digit as u32;
+    [(65535 * 2 * (11 - d) / 11).min(65535), (65535 * 2 * d / 11).min(65535), 0]
+}
+
+/// The readout: digit coverage on a canvas around the panel's centre (brightness on the upper row, signal on the lower), a dark disc behind it, and how far it has faded in (0 hidden .. 15 full). Its buffers are static: the heap is small and mostly the Wi-Fi driver's.
 pub struct Overlay {
     pub fade: u8,
-    value: Option<u8>,
+    /// What the canvas shows: brightness level and signal digit.
+    value: Option<(u8, u8)>,
+    /// The signal row's colour, linear light per channel.
+    tint: [u32; 3],
     coverage: &'static mut [u8; OW * OH],
     /// For each backdrop strength 0..16, the dimmed level of every red, green and blue RGB565 level; built from the font's light table on first use.
     dim: &'static mut [[u16; 128]; 16],
@@ -120,12 +137,14 @@ pub struct Overlay {
 static COVERAGE: ConstStaticCell<[u8; OW * OH]> = ConstStaticCell::new([0; OW * OH]);
 static DIM: ConstStaticCell<[[u16; 128]; 16]> = ConstStaticCell::new([[0; 128]; 16]);
 
-const OW: usize = 240;
-const OH: usize = 120;
+/// The canvas: two rows of digits packed at 84 px (`goes font`), each about 83 px from the top of the tallest to the bottom of the lowest, with ROW_GAP between them.
+const OW: usize = 176;
+const OH: usize = 176;
+const ROW_GAP: i32 = 6;
 const OX: i32 = (WIDTH as i32 - OW as i32) / 2;
 const OY: i32 = (HEIGHT as i32 - OH as i32) / 2;
 /// The backdrop disc: radius and soft edge (px).
-const DISC: i32 = 120;
+const DISC: i32 = 132;
 const EDGE: i32 = 14;
 /// How dark the backdrop gets at full strength: light × (256 − 15 · DIM_STEP) / 256.
 const DIM_STEP: u32 = 10;
@@ -133,7 +152,12 @@ const DIM_STEP: u32 = 10;
 impl Overlay {
     /// Call once: takes the static buffers.
     pub fn new() -> Overlay {
-        Overlay { fade: 0, value: None, coverage: COVERAGE.take(), dim: DIM.take(), dim_ready: false }
+        Overlay { fade: 0, value: None, tint: [0; 3], coverage: COVERAGE.take(), dim: DIM.take(), dim_ready: false }
+    }
+
+    /// Whether the canvas already shows this level and signal digit.
+    pub fn shows(&self, level: u8, signal: u8) -> bool {
+        self.value == Some((level, signal))
     }
 
     /// Forget the laid-out digits and tables, after the font changes.
@@ -142,8 +166,8 @@ impl Overlay {
         self.dim_ready = false;
     }
 
-    /// Lay out `value` as two dozenal digits, centred.
-    pub fn set(&mut self, font: &Font, value: u8) {
+    /// Lay out brightness `level` as two dozenal digits above the centre and `signal` as one below it.
+    pub fn set(&mut self, font: &Font, level: u8, signal: u8) {
         if !self.dim_ready {
             for (s, t) in self.dim.iter_mut().enumerate() {
                 for (c, n, base) in [(0, 32, 0), (1, 64, 32), (2, 32, 96)] {
@@ -154,17 +178,24 @@ impl Overlay {
             }
             self.dim_ready = true;
         }
-        if self.value == Some(value) {
+        if self.shows(level, signal) {
             return;
         }
-        self.value = Some(value);
+        self.value = Some((level, signal));
+        self.tint = signal_colour(signal);
         self.coverage.fill(0);
-        let digits = [font.glyph(0x10 + (value / 12) as u32), font.glyph(0x10 + (value % 12) as u32)];
-        let (Some(a), Some(b)) = (&digits[0], &digits[1]) else { return };
-        let cap = (-a.top).max(-b.top);
-        let baseline = (OH as i32 + cap) / 2;
-        let mut pen = (OW as i32 - a.advance - b.advance) / 2;
-        for g in [a, b] {
+        // Rows sit on the digits' common ink extent, so every digit lands at the same height whatever is shown.
+        let all: Vec<Glyph> = (0x10..0x1C).filter_map(|cp| font.glyph(cp)).collect();
+        let (Some(top), Some(bottom)) = (all.iter().map(|g| g.top).min(), all.iter().map(|g| g.top + g.h as i32).max()) else { return };
+        self.row(font, &[level / 12, level % 12], OH as i32 / 2 - ROW_GAP / 2 - bottom);
+        self.row(font, &[signal], OH as i32 / 2 + ROW_GAP / 2 - top);
+    }
+
+    /// Draw dozenal `digits` centred across the canvas on `baseline`.
+    fn row(&mut self, font: &Font, digits: &[u8], baseline: i32) {
+        let glyphs: Vec<Glyph> = digits.iter().filter_map(|&d| font.glyph(0x10 + d as u32)).collect();
+        let mut pen = (OW as i32 - glyphs.iter().map(|g| g.advance).sum::<i32>()) / 2;
+        for g in &glyphs {
             let (gx, gy) = (pen + g.left, baseline + g.top);
             font.draw(g, |x, y, v| {
                 let (cx, cy) = (gx + x as i32, gy + y as i32);
@@ -201,9 +232,11 @@ impl Overlay {
                 if (0..OW as i32).contains(&cx) && (0..OH as i32).contains(&cy) {
                     let a = self.coverage[cy as usize * OW + cx as usize] as u32 * self.fade as u32 / 15;
                     if a > 0 {
+                        // White on the brightness row, the signal colour on the row below.
+                        let ink = if cy < OH as i32 / 2 { [65535; 3] } else { self.tint };
                         for (ch, level) in v.iter_mut().enumerate() {
                             let l = font.lin(ch, *level as usize);
-                            *level = font.nearest(ch, (l * (15 - a) + 65535 * a) / 15);
+                            *level = font.nearest(ch, (l * (15 - a) + ink[ch] * a) / 15);
                         }
                     }
                 }
@@ -254,7 +287,7 @@ pub async fn touch(mut i2c: I2c<'static, Blocking>, board: &'static Shared) {
                 (down, y0, from) = (true, y, b.level);
             }
             let level = (from as i32 + UP * (y - y0) / PX_PER_LEVEL).clamp(0, TOP_LEVEL as i32) as u8;
-            if level != b.level || b.overlay.fade != 15 {
+            if level != b.level || b.overlay.fade != 15 || !b.overlay.shows(level, signal_digit(crate::net::rssi())) {
                 b.set_level(level);
                 b.overlay.fade = 15;
                 OVERLAY.signal(());

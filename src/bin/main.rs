@@ -4,7 +4,7 @@
 //! - `s n [hash]` — followed by one raw RGB565 disk frame (only the pixels whose centres lie within 233 px of the panel's centre, row by row, high byte first: 341,160 bytes), stored in flash slot n (the `frames` partition, see partitions.csv). The flash work waits for the loop's hold on its newest frame, which stretches to cover it, so the animation never stutters; only that slot is erased and written. With `hash` (the frame's BLAKE3, 64 hex digits), the slot is read back from flash and hashed, and anything short of an exact match is answered `err s n hash …`. Storing into the playing loop's oldest slot moves the loop on by one, so the new frame plays last.
 //! - `p start count ms [hold]` — play slots start, start+1, … wrapping within 0..count, one every `ms`, holding the last (newest) for `hold` ms before looping (default: `ms`). Kept in flash; the board resumes the loop by itself after a power cut.
 //! - `h n` — the BLAKE3 of what slot n holds, to audit the ring
-//! - `F len hash` — followed by a glyph blob (tools/measure `fontpack`) of `len` bytes, checked against its BLAKE3 and kept in flash; `info` — brightness level, font, touch controller
+//! - `F len hash` — followed by a glyph blob (tools/measure `fontpack`) of `len` bytes, checked against its BLAKE3 and kept in flash; `info` — brightness level, signal strength (dBm, 0 when not connected), font, touch controller
 //!
 //! Touch: drag up or down anywhere to change the brightness (144 levels), shown as two dozenal digits while adjusting; the level is kept in flash.
 //! - `ping`
@@ -259,7 +259,7 @@ impl Board {
         self.level = level;
         self.lcd.set_brightness(ui::LEVELS[level as usize]);
         if let Some(font) = &self.font {
-            self.overlay.set(font, level);
+            self.overlay.set(font, level, ui::signal_digit(net::rssi()));
         }
     }
 
@@ -697,7 +697,7 @@ async fn serve(conn: &mut Conn<'_, '_>, board: &'static Shared, usb: bool) -> Re
             }
             "info" => {
                 let b = board.lock().await;
-                conn.reply(format_args!("ok info level {} font {} touch {:#04x} y {}", b.level, b.font.is_some(), ui::TOUCH_ID.load(Ordering::Relaxed), ui::TOUCH_Y.load(Ordering::Relaxed))).await?;
+                conn.reply(format_args!("ok info level {} rssi {} font {} touch {:#04x} y {}", b.level, net::rssi().unwrap_or(0), b.font.is_some(), ui::TOUCH_ID.load(Ordering::Relaxed), ui::TOUCH_Y.load(Ordering::Relaxed))).await?;
             }
             "h" => match numbers::<1>(words) {
                 Some((a, 1)) if a[0] < SLOTS => {

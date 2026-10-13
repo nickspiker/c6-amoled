@@ -6,7 +6,7 @@
 //!
 //! Usage:
 //!   goes loop [--frames 47] [--fps 15]    keep the board's ring current, polling every minute
-//!   goes font [px]                       pack the readout glyphs (default 112 px) and upload them
+//!   goes font [px]                       pack the readout glyphs (default 84 px) and upload them
 //!   goes frame YYYYmmdd-HHMM [--encode]  fetch and reproject one frame into the cache, and report its bands (and the BLAKE3 of its encoding)
 
 mod abi;
@@ -345,7 +345,7 @@ fn main() {
                 std::fs::write(std::env::temp_dir().join("goes-encoded.bin"), &data).ok();
             }
         }
-        Some("font") => font(args.next().and_then(|v| v.parse().ok()).unwrap_or(112.0)).expect("font upload"),
+        Some("font") => font(args.next().and_then(|v| v.parse().ok()).unwrap_or(84.0)).expect("font upload"),
         _ => eprintln!("usage: goes loop [--frames 47] [--fps 15] | goes font [px]"),
     }
 }
