@@ -12,4 +12,5 @@ serialport = { version = "4.10", default-features = false }
 vsf = { path = "../../../vsf" }
 tiff = "0.11"
 png = "0.18"
+ab_glyph = "0.2"
 serde_json = "1"

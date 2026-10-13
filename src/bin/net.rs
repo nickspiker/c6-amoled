@@ -74,7 +74,11 @@ async fn connection(mut controller: WifiController<'static>) {
                 ADDRESS.store(0, Ordering::Relaxed);
             }
             Err(e) => {
-                println!("wifi: connect failed ({e:?}); retrying");
+                // Just the reason: the whole error's Debug output costs ~2 KB of code.
+                match e {
+                    esp_radio::wifi::ConnectionError::Failed(info) => println!("wifi: connect failed ({:?}); retrying", info.reason),
+                    _ => println!("wifi: connect failed; retrying"),
+                }
                 Timer::after(Duration::from_secs(5)).await;
             }
         }
@@ -120,22 +124,6 @@ async fn mdns(stack: Stack<'static>) {
     }
 }
 
-struct TcpIo<'a, 'b>(&'a mut TcpSocket<'b>);
-
-impl Io for TcpIo<'_, '_> {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
-        self.0.read(buf).await.map_err(|_| ())
-    }
-
-    async fn write(&mut self, mut data: &[u8]) -> Result<(), ()> {
-        while !data.is_empty() {
-            let n = self.0.write(data).await.map_err(|_| ())?;
-            data = &data[n..];
-        }
-        self.0.flush().await.map_err(|_| ())
-    }
-}
-
 /// One client at a time on PORT; each connection runs the command protocol, challenge first.
 #[embassy_executor::task]
 async fn tcp_server(stack: Stack<'static>, board: &'static Shared) {
@@ -150,7 +138,7 @@ async fn tcp_server(stack: Stack<'static>, board: &'static Shared) {
         }
         let peer = socket.remote_endpoint();
         println!("tcp: client {peer:?}");
-        let mut conn = Conn::new(TcpIo(&mut socket));
+        let mut conn = Conn::new(Io::Tcp(&mut socket));
         let _ = serve(&mut conn, board, false).await;
         drop(conn);
         socket.close();

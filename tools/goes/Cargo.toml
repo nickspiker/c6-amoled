@@ -1,0 +1,14 @@
+[package]
+name = "goes"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The GOES-18 satellite loop for the c6-amoled panel: fetches full-disk frames, reprojects them top-down, maps bands onto the panel's primaries with ratcheting black and white, and keeps the board's flash ring current over Wi-Fi"
+
+[dependencies]
+measure = { path = "../measure" }
+hdf5-reader = "0.9"
+ureq = "3"
+serde_json = "1"
+blake3 = "1"
+chrono = "0.4"

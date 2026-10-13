@@ -15,6 +15,8 @@ pub struct PanelModel {
     pub inv: [f32; 9],
     /// Per channel: fraction of full drive emitted at each code (monotone; 0 through the toe).
     pub k: [[f64; 256]; 3],
+    /// Cone response of the light the panel emits at all-black drive: zero for the AMOLED, the backlight's leak for an LCD. It adds to every colour and can't be removed.
+    pub black: [f64; 3],
 }
 
 impl PanelModel {
@@ -59,7 +61,42 @@ impl PanelModel {
                 k[c][code] = k[c][code].max(k[c][code - 1]);
             }
         }
-        PanelModel { prim, inv: invert_matrix_3x3_f32(&prim), k }
+        PanelModel { prim, inv: invert_matrix_3x3_f32(&prim), k, black: [0.0; 3] }
+    }
+
+    /// Build an LCD's model from its sweep (tools/measure plan `lcd`): every reading minus the black reading (the backlight's leak, kept as `black`), primaries from each channel at 255, and each channel's response from its ramp at codes 4, 8, 16 … 248, 255 — log–log between measured codes from 8 up, linear from code 0 to the first, where readings sit near the leak and logs are unstable.
+    pub fn load_lcd(sweep: &Path) -> PanelModel {
+        let sp = |n: &str| read_sp(&sweep.join(format!("{n}.sp")));
+        let black = sp("black");
+        let channels = ["r", "g", "b"];
+        let full: Vec<Spectrum> = channels.iter().map(|c| sp(&format!("ramp_{c}_255")).minus(&black)).collect();
+        let mut prim = [0f32; 9];
+        for (c, s) in full.iter().enumerate() {
+            let l = s.lms();
+            for i in 0..3 {
+                prim[c * 3 + i] = l[i] as f32;
+            }
+        }
+        let measured: Vec<usize> = [4].into_iter().chain((8..=248).step_by(8)).chain([255]).collect();
+        let mut k = [[0f64; 256]; 3];
+        for (c, ch) in channels.iter().enumerate() {
+            let pts: Vec<(usize, f64)> = core::iter::once((0, 0.0)).chain(measured.iter().map(|&code| (code, sp(&format!("ramp_{ch}_{code:03}")).minus(&black).fit(&full[c]).0.max(0.0)))).collect();
+            for w in pts.windows(2) {
+                let ((c0, k0), (c1, k1)) = (w[0], w[1]);
+                for code in c0..=c1 {
+                    k[c][code] = if c0 >= 8 && k0 > 0.0 && k1 > 0.0 {
+                        let t = ((code as f64).ln() - (c0 as f64).ln()) / ((c1 as f64).ln() - (c0 as f64).ln());
+                        (k0.ln() * (1.0 - t) + k1.ln() * t).exp()
+                    } else {
+                        k0 + (k1 - k0) * (code - c0) as f64 / (c1 - c0) as f64
+                    };
+                }
+            }
+            for code in 1..256 {
+                k[c][code] = k[c][code].max(k[c][code - 1]);
+            }
+        }
+        PanelModel { prim, inv: invert_matrix_3x3_f32(&prim), k, black: black.lms() }
     }
 
     /// Replace the primary matrix with full-drive R, G, B spectra (floor-subtracted) captured now — e.g. after the instrument was re-placed, which changes the absolute level reaching it. The response curves are relative and carry over.

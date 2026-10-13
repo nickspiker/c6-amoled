@@ -3,6 +3,7 @@
 //! Colorimetry is VSF's throughout: Stockman & Sharpe 2000 10° cone fundamentals (sum-normalised, so equal-energy light is LMS = 1, 1, 1), Illuminant E white, VSF RGB and wavelength-defined Rec.2020, AGB ratios for chromaticity. CIE 1931 appears nowhere; spotread is used only to capture spectra.
 
 pub mod dither;
+pub mod fontpack;
 pub mod link;
 pub mod model;
 pub mod spectra;
