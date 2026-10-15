@@ -8,9 +8,11 @@
 //!   goes loop [--frames 47] [--fps 15]    keep the board's ring current, polling every minute
 //!   goes font [px]                       pack the readout glyphs (default 84 px) and upload them
 //!   goes frame YYYYmmdd-HHMM [--encode]  fetch and reproject one frame into the cache, and report its bands (and the BLAKE3 of its encoding)
+//!   goes coast [--preview]               build the coastline overlay and upload it (--preview: the newest cached frame with each phase, to /tmp/goes-coast-preview)
 
 mod abi;
 mod board;
+mod coast;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -346,6 +348,55 @@ fn main() {
             }
         }
         Some("font") => font(args.next().and_then(|v| v.parse().ok()).unwrap_or(84.0)).expect("font upload"),
-        _ => eprintln!("usage: goes loop [--frames 47] [--fps 15] | goes font [px]"),
+        Some("coast") => coast_overlay(args.next().as_deref() == Some("--preview")).expect("coast"),
+        _ => eprintln!("usage: goes loop [--frames 47] [--fps 15] | goes font [px] | goes coast [--preview]"),
     }
+}
+
+/// Build the coastline overlay and upload it (`C len hash`, kept in the board's flash), or with `preview`, write the newest cached frame plain and with each phase of the flicker to /tmp/goes-coast-preview.
+fn coast_overlay(preview: bool) -> Result<(), String> {
+    let cov = coast::mask()?;
+    let blob = coast::pack(&cov);
+    println!("coastline: {} pixels, {} bytes packed", cov.iter().filter(|&&c| c != 0).count(), blob.len());
+    if !preview {
+        let mut board = Board::connect()?;
+        board.write(format!("C {} {}\n", blob.len(), blake3::hash(&blob).to_hex()).as_bytes())?;
+        board.write(&blob)?;
+        println!("{}", board.reply("C", 30)?);
+        return Ok(());
+    }
+    // The newest cached frame, encoded as the loop would encode it (against a scratch copy of the ratchet state).
+    let newest = fs::read_dir(frames_dir()).map_err(|e| e.to_string())?.filter_map(|e| e.ok()?.file_name().into_string().ok()?.strip_suffix(".json").map(String::from)).max().ok_or("no cached frame")?;
+    let t = chrono::NaiveDateTime::parse_from_str(&newest, "%Y%m%d-%H%M").map_err(|e| e.to_string())?.and_utc().timestamp();
+    let b = load(t, &[String::new(), String::new(), String::new()])?;
+    let model = PanelModel::load(&repo().join("measurements/i1pro-2026-10-11"), &repo().join("measurements/i1pro-2026-10-11-toe"));
+    let levels = [0, 1, 2].map(|c| Levels::new(&model, c));
+    let mut state = State::load(&b.cal);
+    state.path = std::env::temp_dir().join("goes-state-scratch.json");
+    let data = encode(t, &b, &mut state, &levels, &blue_noise());
+    let mut frame = vec![0u16; N * N];
+    let mut at = 0;
+    for (i, p) in frame.iter_mut().enumerate() {
+        if inside(i % N, i / N) {
+            *p = u16::from_be_bytes([data[at], data[at + 1]]);
+            at += 2;
+        }
+    }
+    let dir = Path::new("/tmp/goes-coast-preview");
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    for (name, sign) in [("plain", 0), ("plus", 1), ("minus", -1)] {
+        let mut rgb = Vec::with_capacity(N * N * 3);
+        for (i, &p) in frame.iter().enumerate() {
+            let p = if sign == 0 || cov[i] == 0 { p } else { coast::nudge(p, cov[i], sign) };
+            let (r, g, b) = ((p >> 11) as u8, (p >> 5 & 63) as u8, (p & 31) as u8);
+            rgb.extend_from_slice(&[r << 3 | r >> 2, g << 2 | g >> 4, b << 3 | b >> 2]);
+        }
+        let path = dir.join(format!("{newest}-{name}.png"));
+        let mut e = png::Encoder::new(std::io::BufWriter::new(fs::File::create(&path).map_err(|e| e.to_string())?), N as u32, N as u32);
+        e.set_color(png::ColorType::Rgb);
+        e.set_depth(png::BitDepth::Eight);
+        e.write_header().map_err(|e| e.to_string())?.write_image_data(&rgb).map_err(|e| e.to_string())?;
+        println!("{}", path.display());
+    }
+    Ok(())
 }

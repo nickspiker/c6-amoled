@@ -155,8 +155,8 @@ async fn tcp_server(stack: Stack<'static>, board: &'static Shared) {
         if socket.accept(PORT).await.is_err() {
             continue;
         }
-        let peer = socket.remote_endpoint();
-        println!("tcp: client {peer:?}");
+        // Not the peer's address: its Debug output (IPv6 formatting with it) costs code the app partition has no room for.
+        println!("tcp: client");
         let mut conn = Conn::new(Io::Tcp(&mut socket));
         let _ = serve(&mut conn, board, false).await;
         drop(conn);

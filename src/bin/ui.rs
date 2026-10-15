@@ -17,9 +17,9 @@ pub const LEVELS: [u8; 144] = [
 ];
 pub const TOP_LEVEL: u8 = 143;
 
-/// Where the packed glyphs live: the `nvs` partition past the settings sector (written with `F`).
+/// Where the packed glyphs live: the `nvs` partition past the settings sector (written with `F`); 8 KB, the 84 px dozenal set taking about 6.3. The coastline overlay follows (see `coast`).
 pub const FONT_ADDR: u32 = 0xA000;
-pub const FONT_SIZE: u32 = 0x5000;
+pub const FONT_SIZE: u32 = 0x2000;
 const FONT_MAGIC: &[u8; 4] = b"FNT1";
 
 /// A glyph blob from tools/measure `fontpack` (its docs give the layout), held in RAM.
@@ -265,7 +265,7 @@ pub async fn touch(mut i2c: I2c<'static, Blocking>, board: &'static Shared) {
     let mut id = [0u8];
     match i2c.write_read(TOUCH, &[0xA7], &mut id) {
         Ok(()) => println!("touch: controller id {:#04x}", id[0]),
-        Err(e) => println!("touch: no answer from {TOUCH:#04x} ({e:?})"),
+        Err(_) => println!("touch: no answer from {TOUCH:#04x}"),
     }
     TOUCH_ID.store(id[0], Ordering::Relaxed);
     // Keep it awake between touches (CST816 DisAutoSleep), so polling always gets an answer.

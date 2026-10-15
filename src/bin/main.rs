@@ -4,7 +4,9 @@
 //! - `s n [hash]` — followed by one raw RGB565 disk frame (only the pixels whose centres lie within 233 px of the panel's centre, row by row, high byte first: 341,160 bytes), stored in flash slot n (the `frames` partition, see partitions.csv). The flash work waits for the loop's hold on its newest frame, which stretches to cover it, so the animation never stutters; only that slot is erased and written. With `hash` (the frame's BLAKE3, 64 hex digits), the slot is read back from flash and hashed, and anything short of an exact match is answered `err s n hash …`. Storing into the playing loop's oldest slot moves the loop on by one, so the new frame plays last.
 //! - `p start count ms [hold]` — play slots start, start+1, … wrapping within 0..count, one every `ms`, holding the last (newest) for `hold` ms before looping (default: `ms`). Kept in flash; the board resumes the loop by itself after a power cut.
 //! - `h n` — the BLAKE3 of what slot n holds, to audit the ring
-//! - `F len hash` — followed by a glyph blob (tools/measure `fontpack`) of `len` bytes, checked against its BLAKE3 and kept in flash; `info` — brightness level, signal strength (dBm, 0 when not connected), font, touch controller
+//! - `F len hash` — followed by a glyph blob (tools/measure `fontpack`) of `len` bytes, checked against its BLAKE3 and kept in flash
+//! - `C len hash` — followed by the coastline overlay (`goes coast`) of `len` bytes, checked against its BLAKE3 and kept in flash; flickered ±16 codes along the coast, one flip per frame period (see `coast`)
+//! - `info` — brightness level, signal strength (dBm, 0 when not connected), font, coastline overlay bytes, touch controller
 //!
 //! Touch: drag up or down anywhere to change the brightness (144 levels), shown as two dozenal digits while adjusting; the level is kept in flash.
 //! - `ping`
@@ -29,6 +31,7 @@
 
 extern crate alloc;
 
+mod coast;
 mod net;
 mod ui;
 
@@ -71,6 +74,7 @@ const BAND_BYTES: usize = WIDTH as usize * BAND_ROWS as usize * 3;
 #[repr(C, align(4))]
 struct Band([u8; BAND_BYTES]);
 static BAND: ConstStaticCell<Band> = ConstStaticCell::new(Band([0; BAND_BYTES]));
+static COAST: ConstStaticCell<coast::Blob> = ConstStaticCell::new(coast::Blob([0; coast::SIZE as usize]));
 
 /// First column inside the disk on row y: a pixel is in when its centre lies within 233 px of the panel's centre (the host uses the same test), worked in doubled coordinates so it stays integer. Rows are symmetric, so the span is `start..WIDTH - start`.
 const fn disk_start(y: u16) -> u16 {
@@ -241,6 +245,11 @@ struct Board {
     overlay: ui::Overlay,
     /// Slots that don't hold a whole frame (bit n for slot n): erased by a store that hasn't verified yet, or found ending in erased flash at boot. The player skips them, so a dropped upload never shows as white.
     incomplete: u64,
+    /// The coastline overlay's strips (`coast`), and their length: 0 for none.
+    coast: &'static mut [u8; coast::SIZE as usize],
+    coast_len: usize,
+    /// The coastline's phase on screen: +1 or −1 (× 16 codes). Each new frame flips it, and so does each flicker step in the hold.
+    coast_sign: i32,
 }
 
 type Shared = Mutex<CriticalSectionRawMutex, Board>;
@@ -326,6 +335,20 @@ impl Board {
                 if let Some(font) = &self.font {
                     self.overlay.apply(font, &mut self.band[..i], x0, y, WIDTH - 2 * x0, rows);
                 }
+            } else {
+                // The coastline goes up with the frame in its current phase. Strips start on even rows, as these bands do, so each lies wholly in one band.
+                let w = WIDTH - 2 * x0;
+                for (sy, sx, sw, data) in coast::strips(&self.coast[..self.coast_len]).skip_while(|s| s.0 < y).take_while(|s| s.0 < y + rows) {
+                    for r in 0..2 {
+                        for k in 0..sw {
+                            let c = coast::coverage(data, sw, r, k);
+                            if c != 0 && sx + k >= x0 && sx + k < WIDTH - x0 {
+                                let at = ((sy + r - y) as usize * w as usize + (sx + k - x0) as usize) * 2;
+                                coast::nudge(&mut self.band[at..at + 2], c, self.coast_sign);
+                            }
+                        }
+                    }
+                }
             }
             self.lcd.begin(x0, y, WIDTH - 2 * x0, rows);
             self.lcd.push(&self.band[..i]);
@@ -333,6 +356,43 @@ impl Board {
             y += rows;
         }
         ((t2 - t).as_micros(), t2.elapsed().as_micros())
+    }
+
+    /// Re-push slot n's coastline strips nudged by `sign` (the frame itself stays up): each strip's two rows from flash into the band buffer, black outside the disk, nudged, and sent as its own small window.
+    fn coast_strips(&mut self, slot: u16, sign: i32) {
+        let base = FRAMES_BASE + slot as u32 * FRAME_BYTES;
+        let page = base & !(FlashStorage::BLOCK_SIZE - 1);
+        let src = &self.window.map(page)[(base - page) as usize..][..FRAME_BYTES as usize];
+        // Where row `row` starts in the slot, walked forward as the strips go down the disk.
+        let (mut row, mut off) = (0u16, 0usize);
+        for (sy, sx, sw, data) in coast::strips(&self.coast[..self.coast_len]) {
+            while row < sy {
+                off += (WIDTH - 2 * DISK_START[row as usize]) as usize * 2;
+                row += 1;
+            }
+            let mut o = off;
+            for r in 0..2 {
+                let s = DISK_START[(sy + r) as usize];
+                for k in 0..sw {
+                    let (x, at) = (sx + k, (r * sw + k) as usize * 2);
+                    let px = &mut self.band[at..at + 2];
+                    if x >= s && x < WIDTH - s {
+                        let from = o + (x - s) as usize * 2;
+                        px.copy_from_slice(&src[from..from + 2]);
+                    } else {
+                        px.fill(0);
+                    }
+                    let c = coast::coverage(data, sw, r, k);
+                    if c != 0 {
+                        coast::nudge(px, c, sign);
+                    }
+                }
+                o += (WIDTH - 2 * s) as usize * 2;
+            }
+            self.lcd.begin(sx, sy, sw, 2);
+            self.lcd.push(&self.band[..sw as usize * 4]);
+            self.lcd.end();
+        }
     }
 }
 
@@ -380,6 +440,8 @@ async fn main(spawner: Spawner) -> ! {
     let (saved, log) = load_log(&mut flash, band);
     let settings = Settings::load(&mut flash);
     let font = load_font(&mut flash, band);
+    let coast = &mut COAST.take().0;
+    let coast_len = coast::load(&mut flash, coast);
     println!("CO5300 up: 466x466, QSPI 40 MHz; {SLOTS} frame slots of {FRAME_BYTES} bytes, read through the cache");
     if let Some(s) = saved {
         println!("resuming loop: {} frames from slot {}", s.count, s.start);
@@ -387,7 +449,7 @@ async fn main(spawner: Spawner) -> ! {
     let wifi = settings.clone();
     println!("font: {}", if font.is_some() { "loaded" } else { "none (upload with `F`)" });
     let level = settings.level;
-    let board = BOARD.init(Mutex::new(Board { lcd, band, flash, window, log, saved, playing: saved, settings, level, font, overlay: ui::Overlay::new(), incomplete: 0 }));
+    let board = BOARD.init(Mutex::new(Board { lcd, band, flash, window, log, saved, playing: saved, settings, level, font, overlay: ui::Overlay::new(), incomplete: 0, coast, coast_len, coast_sign: 1 }));
     {
         // A store cut short (a power cut, a dropped link) leaves the end of its slot erased.
         let mut b = board.lock().await;
@@ -443,6 +505,23 @@ async fn player(board: &'static Shared) {
             }
         }
     }
+    // Until `until`, flip the coastline's phase every `step` (strips only), the true image their average. Each frame draws in the opposite phase to the last, so mid-animation the phase flips once a frame (a frame takes ~55 ms to draw of its ~66, leaving no room for a step between); in the hold it keeps that same pace, one flip per frame period. Skipped while the readout is up.
+    async fn flicker(board: &'static Shared, slot: u16, until: embassy_time::Instant, step: Duration) {
+        let mut at = embassy_time::Instant::now();
+        loop {
+            at += step;
+            if at >= until {
+                return Timer::at(until).await;
+            }
+            Timer::at(at).await;
+            let mut b = board.lock().await;
+            if b.coast_len > 0 && b.overlay.fade == 0 && b.playing.is_some() {
+                let sign = -b.coast_sign;
+                b.coast_sign = sign;
+                b.coast_strips(slot, sign);
+            }
+        }
+    }
     loop {
         // Frozen while the readout is up (a finger on the glass, then the readout lingering and fading): only the readout changes, redrawn on the frame on screen, and the animation picks up again once it has faded.
         if current.is_some() && board.lock().await.overlay.fade > 0 {
@@ -475,6 +554,7 @@ async fn player(board: &'static Shared) {
                     // An incomplete slot is skipped: the previous frame simply stays up for its turn.
                     if b.incomplete & 1 << slot == 0 {
                         on_screen = slot;
+                        b.coast_sign = -b.coast_sign;
                         b.show_slot(slot);
                     }
                     Some((s, i == s.count - 1))
@@ -501,11 +581,12 @@ async fn player(board: &'static Shared) {
         }
         let now = embassy_time::Instant::now();
         if next > now {
-            // Mid-animation the next frame picks up any readout change within one period; only the hold needs redraws of its own.
+            // Mid-animation the next frame picks up any readout change within one period; only the hold needs redraws of its own. Meanwhile the coastline flickers once a frame period.
+            let step = Duration::from_millis(s.ms.max(1) as u64);
             if last {
-                wait(board, on_screen, Timer::at(next)).await;
+                wait(board, on_screen, flicker(board, on_screen, next, step)).await;
             } else {
-                Timer::at(next).await;
+                flicker(board, on_screen, next, step).await;
             }
         } else {
             // Running late (drawing the readout costs time): catch up, but always let the other tasks run once per frame, or touch, USB and the network starve.
@@ -695,9 +776,16 @@ async fn serve(conn: &mut Conn<'_, '_>, board: &'static Shared, usb: bool) -> Re
                     _ => conn.reply(format_args!("err F <length, multiple of 4, at most {}> <blake3>", ui::FONT_SIZE)).await?,
                 }
             }
+            "C" => {
+                let (len, hash) = (words.next().and_then(|w| w.parse::<u32>().ok()), words.next().and_then(unhex32));
+                match (len, hash) {
+                    (Some(len), Some(hash)) if len % 4 == 0 && len >= 12 && len <= coast::SIZE => store_coast(conn, board, len as usize, hash).await?,
+                    _ => conn.reply(format_args!("err C <length, multiple of 4, at most {}> <blake3>", coast::SIZE)).await?,
+                }
+            }
             "info" => {
                 let b = board.lock().await;
-                conn.reply(format_args!("ok info level {} rssi {} font {} touch {:#04x} y {}", b.level, net::rssi().unwrap_or(0), b.font.is_some(), ui::TOUCH_ID.load(Ordering::Relaxed), ui::TOUCH_Y.load(Ordering::Relaxed))).await?;
+                conn.reply(format_args!("ok info level {} rssi {} font {} coast {} touch {:#04x} y {}", b.level, net::rssi().unwrap_or(0), b.font.is_some(), b.coast_len, ui::TOUCH_ID.load(Ordering::Relaxed), ui::TOUCH_Y.load(Ordering::Relaxed))).await?;
             }
             "h" => match numbers::<1>(words) {
                 Some((a, 1)) if a[0] < SLOTS => {
@@ -1221,4 +1309,30 @@ fn hash(x: u32, y: u32) -> u32 {
     h ^= h >> 15;
     h = h.wrapping_mul(0xC2B2_AE3D);
     h ^ (h >> 13)
+}
+
+/// `C len hash`: receive the coastline overlay (`goes coast`) straight into its buffer, check its BLAKE3, keep it in flash at `coast::ADDR` and use it. Answers `ok C` or `err C …`; a bad upload falls back to the kept one. Holds the board while the bytes arrive, so the loop pauses for that moment.
+async fn store_coast(conn: &mut Conn<'_, '_>, board: &'static Shared, len: usize, hash: [u8; 32]) -> Result<(), ()> {
+    let mut guard = board.lock().await;
+    let b = &mut *guard;
+    b.coast_len = 0;
+    let problem = match with_timeout(Duration::from_secs(10), conn.read_exact(&mut b.coast[..len])).await {
+        Ok(Ok(())) if blake3::hash(&b.coast[..len]) != blake3::Hash::from_bytes(hash) => Some("hash mismatch"),
+        Ok(Ok(())) if coast::length(&b.coast[..8]) != Some(len) => Some("not a coastline blob"),
+        Ok(Ok(())) => None,
+        Ok(Err(())) => {
+            b.coast_len = coast::load(&mut b.flash, &mut *b.coast);
+            return Err(());
+        }
+        Err(_) => Some("stalled"),
+    };
+    if let Some(problem) = problem {
+        b.coast_len = coast::load(&mut b.flash, &mut *b.coast);
+        drop(guard);
+        return conn.reply(format_args!("err C {problem}")).await;
+    }
+    let ok = b.flash.erase(coast::ADDR, coast::ADDR + coast::SIZE).is_ok() && b.flash.write_nor(coast::ADDR, &b.coast[..len]).is_ok();
+    b.coast_len = len;
+    drop(guard);
+    conn.reply(format_args!("{} C", if ok { "ok" } else { "err" })).await
 }

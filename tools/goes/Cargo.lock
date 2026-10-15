@@ -305,6 +305,7 @@ dependencies = [
  "chrono",
  "hdf5-reader",
  "measure",
+ "png",
  "serde_json",
  "ureq",
 ]
@@ -1035,7 +1036,7 @@ checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "vsf"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "bitvec",
  "blake3",
