@@ -5,7 +5,7 @@
 //! - `p start count ms [hold]` — play slots start, start+1, … wrapping within 0..count, one every `ms`, holding the last (newest) for `hold` ms before looping (default: `ms`). Kept in flash; the board resumes the loop by itself after a power cut.
 //! - `h n` — the BLAKE3 of what slot n holds, to audit the ring
 //! - `F len hash` — followed by a glyph blob (tools/measure `fontpack`) of `len` bytes, checked against its BLAKE3 and kept in flash
-//! - `C len hash` — followed by the coastline overlay (`goes coast`) of `len` bytes, checked against its BLAKE3 and kept in flash; flickered ±16 codes along the coast, one flip per frame period (see `coast`)
+//! - `C len hash` — followed by the coastline overlay (`goes coast`) of `len` bytes, checked against its BLAKE3 and kept in flash; flickered between green and magenta along the coast, one flip per frame period (see `coast`)
 //! - `info` — brightness level, signal strength (dBm, 0 when not connected), font, coastline overlay bytes, touch controller
 //!
 //! Touch: drag up or down anywhere to change the brightness (144 levels), shown as two dozenal digits while adjusting; the level is kept in flash.
@@ -248,7 +248,7 @@ struct Board {
     /// The coastline overlay's strips (`coast`), and their length: 0 for none.
     coast: &'static mut [u8; coast::SIZE as usize],
     coast_len: usize,
-    /// The coastline's phase on screen: +1 or −1 (× 16 codes). Each new frame flips it, and so does each flicker step in the hold.
+    /// The coastline's phase on screen: +1 or −1 (× `coast::GREEN` codes on green, the opposite × `coast::RED_BLUE` on red and blue). Each new frame flips it, and so does each flicker step in the hold.
     coast_sign: i32,
 }
 

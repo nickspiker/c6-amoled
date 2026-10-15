@@ -1,4 +1,4 @@
-//! The coastline overlay: Natural Earth's 1:10m coastline projected exactly as the frames are, drawn as a 1.5 px anti-aliased line, and packed into strips for the board, which flickers it ±16 codes at 30 Hz around the true image (see the firmware's `coast`).
+//! The coastline overlay: Natural Earth's 1:10m coastline projected exactly as the frames are, drawn as an anti-aliased line LINE_PX wide, and packed into strips for the board, which flickers it between green and magenta (±16 codes on red and blue, ±8 on green), once per frame period, around the true image (see the firmware's `coast`).
 
 use std::fs;
 
@@ -11,6 +11,8 @@ const A: f64 = 6_378_137.0;
 const B: f64 = 6_356_752.314_14;
 /// Strips on one row pair closer than this many pixels merge into one: a window's setup costs more than pushing that many unchanged pixels.
 const MERGE_GAP: usize = 32;
+/// The line's width in pixels.
+const LINE_PX: f64 = 2.0;
 
 /// The coastline's polylines as (lon, lat) in degrees, downloaded once into the cache.
 fn polylines() -> Result<Vec<Vec<(f64, f64)>>, String> {
@@ -62,7 +64,7 @@ fn projector() -> impl Fn(f64, f64) -> Option<(f64, f64)> {
     }
 }
 
-/// Coverage per disk pixel, 0..=15: a 1.5 px line, each pixel 1.25 minus its centre's distance to the nearest segment, clamped to 0..1 and floored to sixteenths (at most 15).
+/// Coverage per disk pixel, 0..=15: a line LINE_PX wide, each pixel half that plus a half minus its centre's distance to the nearest segment, clamped to 0..1 and floored to sixteenths (at most 15).
 pub fn mask() -> Result<Vec<u8>, String> {
     let project = projector();
     let mut cov = vec![0f64; N * N];
@@ -84,7 +86,7 @@ pub fn mask() -> Result<Vec<u8>, String> {
                     let t = if len2 > 0.0 { (((px - x0) * dx + (py - y0) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
                     let d = ((px - x0 - t * dx).powi(2) + (py - y0 - t * dy).powi(2)).sqrt();
                     let c = &mut cov[y * N + x];
-                    *c = c.max((1.25 - d).clamp(0.0, 1.0));
+                    *c = c.max((LINE_PX / 2.0 + 0.5 - d).clamp(0.0, 1.0));
                 }
             }
         }
@@ -136,12 +138,16 @@ pub fn pack(cov: &[u8]) -> Vec<u8> {
     out
 }
 
-/// One RGB565 pixel nudged by `sign` × 16 codes in gamma space, scaled by coverage `c` (0..=15): red and blue move 2c/15 of their 5-bit levels, green 4c/15 of its 6-bit ones, floored, clamped at the ends. The board does the same.
+/// The board's flicker strengths (its `coast::RED_BLUE` and `coast::GREEN`), in 8-bit codes, for the preview.
+const RED_BLUE: i32 = 16;
+const GREEN: i32 = 8;
+
+/// One RGB565 pixel nudged in gamma space, green by `sign` × GREEN codes and red and blue by −`sign` × RED_BLUE (the phases alternate green and magenta), scaled by coverage `c` (0..=15) and floored onto each channel's levels (8 codes a red or blue level, 4 a green one), clamped at the ends. The board does the same.
 pub fn nudge(p: u16, c: u8, sign: i32) -> u16 {
     let c = c as i32;
-    let ch = |v: u16, shift: u32, mask: i32, step: i32| ((v >> shift) as i32 & mask) + sign * (step * c / 15);
-    let r = ch(p, 11, 31, 2).clamp(0, 31) as u16;
-    let g = ch(p, 5, 63, 4).clamp(0, 63) as u16;
-    let b = ch(p, 0, 31, 2).clamp(0, 31) as u16;
+    let ch = |v: u16, shift: u32, mask: i32, codes: i32, by: i32| ((v >> shift) as i32 & mask) + by * c / (15 * codes);
+    let r = ch(p, 11, 31, 8, -sign * RED_BLUE).clamp(0, 31) as u16;
+    let g = ch(p, 5, 63, 4, sign * GREEN).clamp(0, 63) as u16;
+    let b = ch(p, 0, 31, 8, -sign * RED_BLUE).clamp(0, 31) as u16;
     r << 11 | g << 5 | b
 }

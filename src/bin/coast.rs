@@ -1,4 +1,4 @@
-//! The coastline overlay: strips of anti-aliased coverage along the coast (built and uploaded by `goes coast`), flickered ±16 codes in gamma space, one flip per frame period, so the outline shows on any cloud while the time-average stays the true image.
+//! The coastline overlay: strips of anti-aliased coverage along the coast (built and uploaded by `goes coast`), flickered in gamma space between green and magenta (±RED_BLUE codes on red and blue, ±GREEN on green) (green up and red and blue down, then the reverse), one flip per frame period, so the outline shows on any cloud while the time-average stays the true image.
 //!
 //! The blob: "CST1", its whole length (u32, little-endian, a whole number of words), then strips over row pairs (the panel's windows must start and span even rows and columns): even row, even first column, even width (u16 each, little-endian), then each pixel's coverage 0..=15 as a nibble, high first, the first row then the second (width bytes in all). Strips are in row order. Ends with row 0xFFFF.
 
@@ -49,11 +49,15 @@ pub fn coverage(data: &[u8], w: u16, r: u16, k: u16) -> u8 {
     if i % 2 == 0 { data[i / 2] >> 4 } else { data[i / 2] & 15 }
 }
 
-/// One RGB565 pixel (high byte first, in place) nudged by `sign` × 16 codes in gamma space, scaled by coverage `c` (0..=15): red and blue move 2c/15 of their 5-bit levels, green 4c/15 of its 6-bit ones, floored, clamped at the ends. The same in both phases, so they average out wherever nothing clamps.
+/// The flicker's strength: how far each phase moves a fully covered pixel's red and blue, and its green, in 8-bit codes (gamma space).
+pub const RED_BLUE: i32 = 16;
+pub const GREEN: i32 = 8;
+
+/// One RGB565 pixel (high byte first, in place) nudged in opposite directions, green by `sign` × GREEN codes and red and blue by −`sign` × RED_BLUE, so the phases alternate green and magenta: a hue flicker rather than a brightness one. Scaled by coverage `c` (0..=15) and floored onto each channel's levels (8 codes a red or blue level, 4 a green one), clamped at the ends. Each channel moves equally in both phases, so they average out wherever nothing clamps.
 pub fn nudge(px: &mut [u8], c: u8, sign: i32) {
     let p = u16::from_be_bytes([px[0], px[1]]);
     let c = c as i32;
-    let ch = |shift: u32, max: i32, step: i32| (((p >> shift) as i32 & max) + sign * (step * c / 15)).clamp(0, max) as u16;
-    let q = ch(11, 31, 2) << 11 | ch(5, 63, 4) << 5 | ch(0, 31, 2);
+    let ch = |shift: u32, max: i32, codes: i32, by: i32| (((p >> shift) as i32 & max) + by * c / (15 * codes)).clamp(0, max) as u16;
+    let q = ch(11, 31, 8, -sign * RED_BLUE) << 11 | ch(5, 63, 4, sign * GREEN) << 5 | ch(0, 31, 8, -sign * RED_BLUE);
     px.copy_from_slice(&q.to_be_bytes());
 }
