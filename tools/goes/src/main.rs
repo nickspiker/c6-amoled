@@ -5,7 +5,7 @@
 //! Each new frame is fetched (only the chunks under the disk), reprojected, ratcheted, dithered to RGB565 against the panel model, and written into the one ring slot holding the oldest frame over Wi-Fi; the board checks it against its BLAKE3. State lives in the repo (git-ignored): state/white.json (ends and every move), state/ring.json (slots), cache/frames (radiances while the ring holds the frame).
 //!
 //! Usage:
-//!   goes loop [--frames 47] [--fps 15]    keep the board's ring current, polling every minute
+//!   goes loop [--frames 46] [--fps 15]    keep the board's ring current, polling every minute
 //!   goes font [px]                       pack the readout glyphs (default 84 px) and upload them
 //!   goes frame YYYYmmdd-HHMM [--encode]  fetch and reproject one frame into the cache, and report its bands (and the BLAKE3 of its encoding)
 //!   goes coast [--preview]               build the coastline overlay and upload it (--preview: the newest cached frame with each phase, to /tmp/goes-coast-preview)
@@ -315,7 +315,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("loop") => {
-            let (mut count, mut fps) = (47, 15.0);
+            let (mut count, mut fps) = (46, 15.0);
             while let Some(a) = args.next() {
                 match a.as_str() {
                     "--frames" => count = args.next().and_then(|v| v.parse().ok()).expect("--frames N"),
@@ -349,7 +349,7 @@ fn main() {
         }
         Some("font") => font(args.next().and_then(|v| v.parse().ok()).unwrap_or(84.0)).expect("font upload"),
         Some("coast") => coast_overlay(args.next().as_deref() == Some("--preview")).expect("coast"),
-        _ => eprintln!("usage: goes loop [--frames 47] [--fps 15] | goes font [px] | goes coast [--preview]"),
+        _ => eprintln!("usage: goes loop [--frames 46] [--fps 15] | goes font [px] | goes coast [--preview]"),
     }
 }
 

@@ -18,6 +18,8 @@
 //! - `t n` — show slot n once, answering with the flash-map and draw times
 //! - `f r g b` — fill the whole screen; `w s r g b` — an s×s square (s even) centred on black; `b n` — brightness register (51h); `m 16|24` — RGB565 or RGB888 interface format; `i` — followed by one raw RGB888 frame (466 × 466 × 3 bytes), drawn as it arrives. These stop the loop until the next `p`.
 //!
+//! PWR (GPIO1), once released, switches the board to the marbles (simulon's round firmware, in the other app slot: see partitions.csv) and restarts into it; PWR there switches back.
+//!
 //! Also kept: the bring-up test patterns and brightness sweep. Patterns: colour bars (RGB order + byte order), ramps (16-bit banding), geometry (column offset + rotation), a single-pixel star field and a 1px checkerboard (does the CO5300's frame-memory compression smear fine detail?), then a moving square for partial-update speed.
 
 #![no_std]
@@ -46,12 +48,14 @@ use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer, with_timeout};
 use esp_backtrace as _;
+use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
+use esp_bootloader_esp_idf::partitions::{AppPartitionSubType, PARTITION_TABLE_MAX_LEN};
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
     dma_rx_buffer,
     dma_tx_buffer,
-    gpio::{Level, Output, OutputConfig},
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
     spi::{
         Mode,
         master::{Config, Spi},
@@ -114,10 +118,10 @@ const FRAME_BYTES: u32 = {
 const _: () = assert!(FRAME_BYTES % 4 == 0, "flash reads and writes go by whole words");
 
 /// The `frames` partition (partitions.csv): frames packed back to back, so one more fits than if each started on a sector (a slot shares its first and last sector with its neighbours; see `write_slot`), then one sector for the play-settings log.
-const FRAMES_BASE: u32 = 0xB_4000;
-const FRAMES_SIZE: u32 = 0xF4_C000;
+const FRAMES_BASE: u32 = 0xC_0000;
+const FRAMES_SIZE: u32 = 0xEF_E000;
 const SLOTS: u16 = ((FRAMES_SIZE - FlashStorage::SECTOR_SIZE) / FRAME_BYTES) as u16;
-const _: () = assert!(SLOTS == 47, "partitions.csv no longer leaves room for 47 frames");
+const _: () = assert!(SLOTS == 46, "partitions.csv no longer leaves room for 46 frames");
 /// MMU pages to map one slot, which needn't start on a page.
 const MAP_PAGES: u32 = FRAME_BYTES.div_ceil(FlashStorage::BLOCK_SIZE) + 1;
 /// Rows per rectangle when covering the disk; even, as CO5300 windows must be.
@@ -464,6 +468,7 @@ async fn main(spawner: Spawner) -> ! {
     }
     board.lock().await.set_level(level);
     spawner.spawn(player(board).expect("player task"));
+    spawner.spawn(power_button(Input::new(peripherals.GPIO1, InputConfig::default().with_pull(Pull::Up)), board).expect("power button task"));
     let i2c = esp_hal::i2c::master::I2c::new(peripherals.I2C0, esp_hal::i2c::master::Config::default().with_frequency(Rate::from_khz(400)))
         .expect("I2C config")
         .with_sda(peripherals.GPIO8)
@@ -480,6 +485,28 @@ async fn main(spawner: Spawner) -> ! {
     println!("ready");
     loop {
         let _ = serve(&mut usb, board, true).await;
+    }
+}
+
+/// PWR, once released: have the bootloader start the marbles (app slot 1) from now on, and restart into it. It only counts once it's been seen released, as it may still be held from switching the board on.
+#[embassy_executor::task]
+async fn power_button(pin: Input<'static>, board: &'static Shared) {
+    loop {
+        while pin.is_low() {
+            Timer::after(Duration::from_millis(20)).await;
+        }
+        while pin.is_high() {
+            Timer::after(Duration::from_millis(20)).await;
+        }
+        while pin.is_low() {
+            Timer::after(Duration::from_millis(20)).await;
+        }
+        let mut b = board.lock().await;
+        let mut table = [0; PARTITION_TABLE_MAX_LEN];
+        match OtaUpdater::new(&mut b.flash, &mut table).and_then(|mut ota| ota.ota_data()?.set_current_app_partition(AppPartitionSubType::Ota1)) {
+            Ok(()) => esp_hal::system::software_reset(),
+            Err(e) => println!("can't switch to the marbles: {e:?}"),
+        }
     }
 }
 
@@ -937,7 +964,7 @@ async fn store(conn: &mut Conn<'_, '_>, board: &'static Shared, slot: u16, hash:
     if playing {
         AT_HOLD.reset();
         STORE_WANTED.store(true, Ordering::Release);
-        // A whole pass is at most 47 frames plus the hold; don't wait forever if the player is somehow stuck.
+        // A whole pass is at most 46 frames plus the hold; don't wait forever if the player is somehow stuck.
         let _ = with_timeout(Duration::from_secs(15), AT_HOLD.wait()).await;
     }
     let result = write_slot(conn, board, slot, hash).await;

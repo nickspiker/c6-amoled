@@ -1,5 +1,8 @@
+# Shared with c6-amoled (keep the two identical): the GOES loop in ota_0, the marbles in ota_1, and PWR in either switches to the other. The frame store gave up its 47th slot to make room; nvs (settings, font, coastline) is where it always was.
 # Name,   Type, SubType,   Offset,   Size
 nvs,      data, nvs,       0x9000,   0x6000
 phy_init, data, phy,       0xf000,   0x1000
-factory,  app,  factory,   0x10000,  0xA4000
-frames,   data, undefined, 0xB4000,  0xF4C000
+goes,     app,  ota_0,     0x10000,  0xB0000
+frames,   data, undefined, 0xC0000,  0xEFE000
+otadata,  data, ota,       0xFBE000, 0x2000
+marbles,  app,  ota_1,     0xFC0000, 0x40000
