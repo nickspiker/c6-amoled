@@ -7,7 +7,8 @@ use std::sync::Arc;
 use hdf5_reader::storage::{BlockCacheStorage, RangeRequestStorage};
 use hdf5_reader::{Dataset, Hdf5File, SliceInfo, SliceInfoElem};
 
-pub const BUCKET: &str = "https://noaa-goes18.s3.amazonaws.com";
+/// The dual-stack endpoint (IPv4 and IPv6): the plain one is IPv4-only, and on 2026-10-19 this connection's IPv4 went down while IPv6 kept working.
+pub const BUCKET: &str = "https://noaa-goes18.s3.dualstack.us-east-1.amazonaws.com";
 pub const N: usize = 466;
 
 /// A band's calibration: `kappa0` turns radiance into reflectance factor (bands 1–6); the Planck coefficients turn it into brightness temperature (7–16).
@@ -37,8 +38,14 @@ impl Cal {
     }
 }
 
+/// One HTTP agent for every S3 request, with a limit on each: without one, a connection that goes quiet mid-read blocks forever (on 2026-10-17 one hung the loop for 34 hours with the puck replaying the same frames). A 1 MiB block normally takes well under a second; a failed poll is retried a minute later.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(60))).build().into())
+}
+
 fn get(url: &str) -> Result<String, String> {
-    ureq::get(url).call().map_err(|e| e.to_string())?.body_mut().read_to_string().map_err(|e| e.to_string())
+    agent().get(url).call().map_err(|e| e.to_string())?.body_mut().read_to_string().map_err(|e| e.to_string())
 }
 
 /// Object keys under a prefix (an hour folder holds well under the listing's 1000-key page).
@@ -67,9 +74,9 @@ pub fn hour_prefix(t: i64) -> String {
 /// An HDF5 file read lazily over HTTP: 1 MiB blocks, fetched on demand and cached.
 fn open(key: &str) -> Result<Hdf5File, String> {
     let url = format!("{BUCKET}/{key}");
-    let len: u64 = ureq::head(&url).call().map_err(|e| e.to_string())?.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse().ok()).ok_or("no length")?;
+    let len: u64 = agent().head(&url).call().map_err(|e| e.to_string())?.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse().ok()).ok_or("no length")?;
     let remote = RangeRequestStorage::new(len, move |off, n| {
-        let mut r = ureq::get(&url).header("Range", format!("bytes={}-{}", off, off + n as u64 - 1)).call().map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut r = agent().get(&url).header("Range", format!("bytes={}-{}", off, off + n as u64 - 1)).call().map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(r.body_mut().with_config().limit(u64::MAX).read_to_vec().map_err(|e| std::io::Error::other(e.to_string()))?)
     });
     Hdf5File::from_storage(Arc::new(BlockCacheStorage::new(Arc::new(remote), 1 << 20, 512))).map_err(|e| e.to_string())
